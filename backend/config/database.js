@@ -83,10 +83,20 @@ async function ensureNeonShelfSchemaCompatibility() {
   if (!pgPool) throw new Error('Neon DB not initialized. Call initializeDatabase() first');
 
   const safeStatements = [
+    "ALTER TABLE IF EXISTS books ADD COLUMN IF NOT EXISTS total_stock INTEGER DEFAULT 5",
+    "ALTER TABLE IF EXISTS books ADD COLUMN IF NOT EXISTS available INTEGER DEFAULT 5",
+    "ALTER TABLE IF EXISTS books ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true",
+    "ALTER TABLE IF EXISTS books ADD COLUMN IF NOT EXISTS cover_url TEXT",
     "ALTER TABLE IF EXISTS wishlist ADD COLUMN IF NOT EXISTS added_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP",
     "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS borrowed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP",
     "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS due_date TIMESTAMPTZ",
+    "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS due_at TIMESTAMPTZ",
     "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS returned_at TIMESTAMPTZ",
+    "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS extended BOOLEAN DEFAULT false",
+    "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
+    "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS user_id UUID",
+    "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS book_id UUID",
+    "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS reading_time_minutes INTEGER DEFAULT 0",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS status TEXT",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ",
@@ -139,6 +149,7 @@ async function ensureNeonShelfSchemaCompatibility() {
        END IF;
      END $$;`,
     `UPDATE reading_sessions SET status = COALESCE(status, 'reading') WHERE status IS NULL`,
+    `UPDATE reading_sessions SET reading_time_minutes = COALESCE(reading_time_minutes, 0) WHERE reading_time_minutes IS NULL`,
   ];
 
   for (const statement of backfillBlocks) {

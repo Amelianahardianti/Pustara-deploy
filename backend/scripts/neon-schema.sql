@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS books (
     total_stock INT DEFAULT 5,
     available INT DEFAULT 5,
     is_active BOOLEAN DEFAULT true,
+    cover_url TEXT,
     file_url TEXT,
     file_type VARCHAR(50),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -88,6 +89,30 @@ CREATE TABLE IF NOT EXISTS loans (
 CREATE INDEX idx_loans_user_id ON loans(user_id);
 CREATE INDEX idx_loans_book_id ON loans(book_id);
 CREATE INDEX idx_loans_status ON loans(status);
+
+-- =========================================
+-- READING SESSIONS TABLE
+-- =========================================
+CREATE TABLE IF NOT EXISTS reading_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL,
+    book_id UUID NOT NULL,
+    current_page INT DEFAULT 0,
+    total_pages INT DEFAULT 0,
+    progress_percentage NUMERIC(5, 2) DEFAULT 0,
+    reading_time_minutes INT DEFAULT 0,
+    status VARCHAR(50) DEFAULT 'reading' NOT NULL,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    finished_at TIMESTAMP,
+    CONSTRAINT chk_reading_sessions_status CHECK (status IN ('reading', 'paused', 'finished', 'active')),
+    CONSTRAINT fk_reading_sessions_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_reading_sessions_book FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_reading_sessions_user_id ON reading_sessions(user_id);
+CREATE INDEX idx_reading_sessions_book_id ON reading_sessions(book_id);
+CREATE INDEX idx_reading_sessions_status ON reading_sessions(status);
 
 -- =========================================
 -- NOTIFICATIONS TABLE

@@ -17,6 +17,7 @@ router.get('/me', shelfController.getMyShelf);
 router.get('/me/status/:bookId', shelfController.getMyBookStatus);
 router.post('/me/borrow/:bookId', shelfController.borrowBook);
 router.post('/me/return/:bookId', shelfController.returnBook);
+router.post('/me/extend/:loanId', shelfController.extendLoan);
 router.post('/me/wishlist/:bookId', shelfController.addToWishlist);
 router.delete('/me/wishlist/:bookId', shelfController.removeFromWishlist);
 

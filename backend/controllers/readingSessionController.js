@@ -4,6 +4,16 @@
  */
 
 const { getPool } = require('../config/database');
+const ReadingSessionService = require('../services/readingSessionService');
+
+function normalizeReadingPayload(body = {}) {
+  return {
+    bookId: body.bookId || body.book_id || null,
+    currentPage: body.current_page ?? body.currentPage,
+    readingTimeMinutes: body.reading_time_minutes ?? body.readingTimeMinutes,
+    status: body.status || 'reading',
+  };
+}
 
 /**
  * Start a new reading session for a book
@@ -19,7 +29,7 @@ async function startReadingSession(req, res) {
 
     // Verify book exists
     const bookCheck = await pool.query(
-      'SELECT id, total_pages FROM books WHERE id = $1 AND is_active = true',
+      'SELECT id, pages FROM books WHERE id = $1 AND is_active = true',
       [bookId]
     );
 
@@ -27,7 +37,7 @@ async function startReadingSession(req, res) {
       return res.status(404).json({ error: 'Book not found' });
     }
 
-    const bookTotalPages = bookCheck.rows[0].total_pages || total_pages;
+    const bookTotalPages = bookCheck.rows[0].pages || total_pages;
 
     // Check if session already exists
     const existingSession = await pool.query(
@@ -222,6 +232,105 @@ async function finishReadingSession(req, res) {
 }
 
 /**
+ * Update reading progress by bookId
+ * POST /reading/update
+ */
+async function updateReadingProgressByBook(req, res) {
+  try {
+    const { uid } = req.user;
+    const { bookId, currentPage, readingTimeMinutes, status } = normalizeReadingPayload(req.body);
+
+    if (!bookId) {
+      return res.status(400).json({ error: 'bookId is required' });
+    }
+
+    if (status === 'paused' && currentPage === undefined && readingTimeMinutes === undefined) {
+      const pausedResult = await ReadingSessionService.pauseReading(uid, bookId);
+      if (!pausedResult.success) {
+        return res.status(400).json({ error: pausedResult.message });
+      }
+
+      return res.json({
+        message: pausedResult.message,
+        data: pausedResult.data,
+      });
+    }
+
+    const result = await ReadingSessionService.updateReadingProgress(uid, bookId, currentPage, readingTimeMinutes);
+
+    if (!result.success) {
+      return res.status(400).json({ error: result.message });
+    }
+
+    return res.json({
+      message: result.message,
+      data: result.data,
+    });
+  } catch (error) {
+    console.error('Error updating reading progress by book:', error);
+    res.status(500).json({ error: 'Failed to update reading progress' });
+  }
+}
+
+/**
+ * Finish reading session by bookId
+ * POST /reading/finish
+ */
+async function finishReadingByBook(req, res) {
+  try {
+    const { uid } = req.user;
+    const { bookId } = normalizeReadingPayload(req.body);
+
+    if (!bookId) {
+      return res.status(400).json({ error: 'bookId is required' });
+    }
+
+    const result = await ReadingSessionService.finishReading(uid, bookId);
+
+    if (!result.success) {
+      return res.status(400).json({ error: result.message });
+    }
+
+    return res.json({
+      message: result.message,
+      data: result.data,
+    });
+  } catch (error) {
+    console.error('Error finishing reading by book:', error);
+    res.status(500).json({ error: 'Failed to finish reading session' });
+  }
+}
+
+/**
+ * Pause reading by bookId
+ * POST /reading/pause
+ */
+async function pauseReadingByBook(req, res) {
+  try {
+    const { uid } = req.user;
+    const { bookId } = normalizeReadingPayload(req.body);
+
+    if (!bookId) {
+      return res.status(400).json({ error: 'bookId is required' });
+    }
+
+    const result = await ReadingSessionService.pauseReading(uid, bookId);
+
+    if (!result.success) {
+      return res.status(400).json({ error: result.message });
+    }
+
+    return res.json({
+      message: result.message,
+      data: result.data,
+    });
+  } catch (error) {
+    console.error('Error pausing reading by book:', error);
+    res.status(500).json({ error: 'Failed to pause reading session' });
+  }
+}
+
+/**
  * Get user's current reading sessions
  * GET /reading/sessions
  */
@@ -305,6 +414,9 @@ module.exports = {
   startReadingSession,
   updateReadingProgress,
   finishReadingSession,
+  updateReadingProgressByBook,
+  finishReadingByBook,
+  pauseReadingByBook,
   getUserSessions,
   getSessionDetails,
 };

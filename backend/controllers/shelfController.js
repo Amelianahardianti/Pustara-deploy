@@ -87,6 +87,24 @@ async function getActiveLoan(userId, bookId) {
   return rows[0] || null;
 }
 
+async function getLoanByIdentifier(userId, identifier) {
+  const id = String(identifier || '').trim();
+  if (!id) return null;
+
+  const byLoanId = toRows(
+    await db.executeQuery(
+      `SELECT id, book_id, borrowed_at, due_date, returned_at
+       FROM loans
+       WHERE user_id = $1 AND id = $2 AND returned_at IS NULL
+       LIMIT 1`,
+      [userId, id]
+    )
+  );
+  if (byLoanId[0]) return byLoanId[0];
+
+  return getActiveLoan(userId, id);
+}
+
 async function getWishlistRow(userId, bookId) {
   try {
     const rows = toRows(
@@ -235,7 +253,7 @@ exports.borrowBook = async (req, res) => {
     const { bookId } = req.params;
     const bookRows = toRows(
       await db.executeQuery(
-        'SELECT id, title, available, is_active FROM books WHERE id = $1 LIMIT 1',
+        'SELECT id, title, available, total_stock, is_active FROM books WHERE id = $1 LIMIT 1',
         [bookId]
       )
     );
@@ -245,7 +263,7 @@ exports.borrowBook = async (req, res) => {
     }
 
     const book = bookRows[0];
-    const available = Number(book.available || 0);
+    const available = Number(book.available ?? book.total_stock ?? 0);
 
     const existingLoan = await getActiveLoan(actorUserId, bookId);
     if (existingLoan) {
@@ -320,7 +338,7 @@ exports.returnBook = async (req, res) => {
     }
 
     const { bookId } = req.params;
-    const activeLoan = await getActiveLoan(actorUserId, bookId);
+    const activeLoan = await getLoanByIdentifier(actorUserId, bookId);
 
     if (!activeLoan) {
       return res.json({
@@ -339,7 +357,7 @@ exports.returnBook = async (req, res) => {
 
     await db.executeQuery(
       'UPDATE books SET available = COALESCE(available, 0) + 1 WHERE id = $1',
-      [bookId]
+      [activeLoan.book_id]
     );
 
     // Pause active reading sessions for this title after the loan is returned.
@@ -347,7 +365,7 @@ exports.returnBook = async (req, res) => {
       `UPDATE reading_sessions
        SET status = 'paused'
        WHERE user_id = $1 AND book_id = $2 AND status IN ('reading', 'active')`,
-      [actorUserId, bookId]
+      [actorUserId, activeLoan.book_id]
     );
 
     res.json({
@@ -362,6 +380,62 @@ exports.returnBook = async (req, res) => {
   } catch (error) {
     console.error('Error returning book:', error.message);
     res.status(500).json({ success: false, message: 'Failed to return book', error: error.message });
+  }
+};
+
+/**
+ * POST /shelf/me/extend/:loanId
+ * Extend due date for an active loan.
+ */
+exports.extendLoan = async (req, res) => {
+  try {
+    const actorUserId = await resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ success: false, message: 'Authentication required' });
+    }
+
+    const { loanId } = req.params;
+    const activeLoan = await getLoanByIdentifier(actorUserId, loanId);
+
+    if (!activeLoan) {
+      return res.status(404).json({ success: false, message: 'Loan not found' });
+    }
+
+    const currentDueDate = activeLoan.due_date ? new Date(activeLoan.due_date) : new Date();
+    currentDueDate.setDate(currentDueDate.getDate() + 3);
+
+    let rows = [];
+    try {
+      rows = toRows(
+        await db.executeQuery(
+          `UPDATE loans
+           SET due_date = $1, extended = true, status = 'extended'
+           WHERE id = $2 AND user_id = $3 AND returned_at IS NULL
+           RETURNING id, due_date`,
+          [currentDueDate, activeLoan.id, actorUserId]
+        )
+      );
+    } catch (error) {
+      console.error('Error extending loan:', error.message);
+      return res.status(500).json({ success: false, message: 'Failed to extend loan', error: error.message });
+    }
+
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Loan not found' });
+    }
+
+    res.json({
+      success: true,
+      message: 'Loan extended successfully',
+      data: {
+        loan_id: String(activeLoan.id),
+        due_date: rows[0].due_date || currentDueDate,
+        extended: true,
+      },
+    });
+  } catch (error) {
+    console.error('Error extending loan:', error.message);
+    res.status(500).json({ success: false, message: 'Failed to extend loan', error: error.message });
   }
 };
 
