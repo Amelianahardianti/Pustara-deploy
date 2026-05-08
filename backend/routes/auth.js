@@ -51,18 +51,19 @@ function createAuthRoutes(authService, verifyTokenMiddleware) {
     authRateLimiter,
     captchaMiddleware,
     asyncHandler(async (req, res) => {
-      console.log(`📝 [AUTH/SIGNIN] Request received:`, { email: req.body.email, hasPassword: !!req.body.password, hasCaptcha: !!req.body.captchaToken });
       const result = await authService.signIn(req.body.email, req.body.password);
-      console.log(`✅ [AUTH/SIGNIN] Response:`, { status: result.status, success: result.success });
       res.status(result.status).json(result);
     })
   );
 
   // POST /auth/verify-token - Verify token & auto-create user in Azure SQL
+  // Also returns the user's role from DB so frontend doesn't need a separate call
   router.post(
     "/verify-token",
     asyncHandler(async (req, res) => {
       const authResult = await authService.verifyToken(req.body.token);
+      
+      let role = 'reader';
       
       if (authResult.success) {
         const { uid, email, displayName } = authResult.user;
@@ -74,19 +75,53 @@ function createAuthRoutes(authService, verifyTokenMiddleware) {
           await UserService.createUser(uid, email, displayName);
           console.log(`✅ User synced successfully`);
         }
+        
+        // Get role from DB
+        const roleResult = await UserService.getUserRole(uid);
+        role = roleResult.success ? roleResult.role : 'reader';
+        console.log(`[verify-token] uid=${uid} email=${email} role=${role}`);
       }
       
-      res.status(authResult.status).json(authResult);
+      // Inject role into response
+      const response = { ...authResult };
+      if (response.data) {
+        response.data.role = role;
+      } else if (response.user) {
+        response.data = { ...response.user, role };
+      } else {
+        response.data = { role };
+      }
+      
+      res.status(authResult.status).json(response);
     })
   );
 
-  // GET /auth/me - Get current user (protected)
+  // GET /auth/me - Get current user role (protected)
   router.get(
     "/me",
     verifyTokenMiddleware,
     asyncHandler(async (req, res) => {
-      const result = await authService.getUserProfile(req.user.uid);
-      res.status(result.status).json(result);
+      const uid = req.user.uid;
+      const email = req.user.email;
+
+      // Direct raw DB query for maximum reliability
+      const { getPool } = require('../config/database');
+      const pool = getPool();
+      const result = await pool.query(
+        'SELECT id, firebase_uid, email, role FROM users WHERE firebase_uid = $1',
+        [uid]
+      );
+
+      console.log(`[/auth/me] token uid="${uid}" email="${email}"`);
+      console.log(`[/auth/me] DB rows:`, JSON.stringify(result.rows));
+
+      const row = result.rows[0];
+      const role = row?.role || 'reader';
+
+      res.status(200).json({
+        success: true,
+        data: { uid, email, role },
+      });
     })
   );
 

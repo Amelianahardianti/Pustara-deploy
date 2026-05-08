@@ -16,32 +16,22 @@ class UserService {
    */
   static async createUser(uid, email, displayName = null) {
     try {
-      console.log(`📝 Creating user: uid=${uid}, email=${email}, displayName=${displayName}`);
-
-      if (!uid || !email) {
-        throw new Error(`Invalid user data: uid=${uid}, email=${email}`);
-      }
+      console.log(`📝 Creating user: uid=${uid}, email=${email}`);
 
       let rows;
       if (isNeon) {
         // Neon: users punya kolom firebase_uid, username, display_name
         const username = email.split('@')[0].toLowerCase().replace(/[^a-z0-9_]/g, '_');
-        console.log(`  Inserting to Neon: firebase_uid=${uid}, username=${username}, email=${email}, display_name=${displayName || username}`);
-        
-        const result = await executeQuery(`
+        rows = await executeQuery(`
           INSERT INTO users (firebase_uid, username, display_name, email)
           VALUES ($1, $2, $3, $4)
           ON CONFLICT (firebase_uid) DO UPDATE SET updated_at = NOW()
           RETURNING *
         `, [uid, username, displayName || username, email]);
-        
-        // Extract rows dari result (executeQuery return { rows: [...] })
-        rows = Array.isArray(result) ? result : (result?.rows || []);
-        console.log(`  Insert result: ${rows.length} rows returned`);
       } else {
         // Azure SQL
         const username = email.split('@')[0].toLowerCase().replace(/[^a-z0-9_]/g, '_');
-        const result = await executeQuery(`
+        rows = await executeQuery(`
           IF NOT EXISTS (SELECT 1 FROM users WHERE firebase_uid = @p1)
           BEGIN
             INSERT INTO users (firebase_uid, username, email, display_name)
@@ -49,19 +39,12 @@ class UserService {
           END
           SELECT * FROM users WHERE firebase_uid = @p1;
         `, [uid, username, email, displayName || username]);
-        
-        rows = Array.isArray(result) ? result : (result?.recordset || []);
       }
 
-      if (!rows || rows.length === 0) {
-        throw new Error(`No rows returned after insert/upsert for uid=${uid}`);
-      }
-
-      console.log(`✅ User created successfully: id=${rows[0].id}, uid=${uid}`);
+      console.log(`✅ User created: ${uid}`);
       return { success: true, data: rows[0] };
     } catch (error) {
-      console.error(`❌ createUser error for uid=${uid}:`, error.message);
-      console.error(`  Stack: ${error.stack}`);
+      console.error(`❌ createUser error:`, error.message);
       return { success: false, error: error.message };
     }
   }
@@ -72,10 +55,7 @@ class UserService {
   static async getUserByUid(uid) {
     try {
       const col  = isNeon ? 'firebase_uid' : 'uid';
-      const result = await executeQuery(`SELECT * FROM ${isNeon ? 'users' : 'Users'} WHERE ${col} = $1`, [uid]);
-      
-      // Extract rows dari result
-      const rows = Array.isArray(result) ? result : (result?.rows || result?.recordset || []);
+      const rows = await executeQuery(`SELECT * FROM ${isNeon ? 'users' : 'Users'} WHERE ${col} = $1`, [uid]);
       return { success: true, data: rows[0] || null };
     } catch (error) {
       console.error('getUserByUid error:', error.message);
@@ -126,6 +106,61 @@ class UserService {
       return { success: true, data: rows[0] };
     } catch (error) {
       console.error('❌ updateUser error:', error.message);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Get user role by Firebase UID
+   */
+  static async getUserRole(uid) {
+    try {
+      const col = isNeon ? 'firebase_uid' : 'uid';
+      const rows = await executeQuery(`SELECT role FROM ${isNeon ? 'users' : 'Users'} WHERE ${col} = $1`, [uid]);
+      return { success: true, role: rows[0]?.role || 'reader' };
+    } catch (error) {
+      console.error('getUserRole error:', error.message);
+      return { success: false, role: 'reader', error: error.message };
+    }
+  }
+
+  /**
+   * Update user role (admin only)
+   */
+  static async updateUserRole(uid, role) {
+    try {
+      if (!['reader', 'admin'].includes(role)) {
+        return { success: false, error: 'Invalid role' };
+      }
+
+      const col = isNeon ? 'firebase_uid' : 'uid';
+      const rows = await executeQuery(
+        `UPDATE ${isNeon ? 'users' : 'Users'} SET role = $1 WHERE ${col} = $2; SELECT * FROM ${isNeon ? 'users' : 'Users'} WHERE ${col} = $2;`,
+        [role, uid]
+      );
+      
+      return { success: true, data: rows[rows.length - 1] };
+    } catch (error) {
+      console.error('updateUserRole error:', error.message);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Get all users (admin only)
+   */
+  static async getAllUsers(limit = 100, offset = 0) {
+    try {
+      const rows = await executeQuery(
+        `SELECT id, uid, email, display_name as displayName, role, createdAt FROM ${isNeon ? 'users' : 'Users'} ORDER BY createdAt DESC LIMIT $1 OFFSET $2`,
+        [limit, offset]
+      );
+      const countResult = await executeQuery(`SELECT COUNT(*) as total FROM ${isNeon ? 'users' : 'Users'}`);
+      const total = countResult[0]?.total || 0;
+      
+      return { success: true, data: rows, total };
+    } catch (error) {
+      console.error('getAllUsers error:', error.message);
       return { success: false, error: error.message };
     }
   }

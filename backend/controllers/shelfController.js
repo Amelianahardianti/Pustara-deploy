@@ -6,6 +6,8 @@
 const db = require('../config/database');
 const UserService = require('../services/userService');
 const { pushActivity } = require('../services/redis');
+const { insertNotification, getUserContact } = require('../services/notificationService');
+const { sendEmail } = require('../services/emailService');
 
 function toRows(result) {
   if (Array.isArray(result)) return result;
@@ -42,22 +44,12 @@ function parseStringArray(value) {
 }
 
 function formatBook(row) {
-  // Generate cover URL from cover_id or isbn (don't query cover_url column, it doesn't exist)
-  let coverUrl = '';
-  if (row.cover_id) {
-    coverUrl = `https://covers.openlibrary.org/b/id/${row.cover_id}-M.jpg`;
-  } else if (row.isbn) {
-    coverUrl = `https://covers.openlibrary.org/b/isbn/${String(row.isbn).replace(/[-\s]/g, '')}-M.jpg`;
-  }
-
   return {
     id: String(row.id || ''),
     title: String(row.title || ''),
     authors: parseStringArray(row.authors),
     genres: parseStringArray(row.genres),
-    cover_url: coverUrl,
-    cover_id: row.cover_id || null,
-    isbn: row.isbn || null,
+    cover_url: row.cover_url ? String(row.cover_url) : '',
     avg_rating: Number(row.avg_rating || 0),
     year: Number(row.year || 0),
     pages: Number(row.pages || 0),
@@ -76,7 +68,12 @@ async function resolveActorUserId(req) {
 async function getActiveLoan(userId, bookId) {
   const rows = toRows(
     await db.executeQuery(
-      `SELECT id, borrowed_at, due_date, returned_at
+      `SELECT id, user_id, book_id, borrowed_at,
+              COALESCE(due_date, due_at) AS due_date,
+              due_at,
+              returned_at,
+              status,
+              extended
        FROM loans
        WHERE user_id = $1 AND book_id = $2 AND returned_at IS NULL
        ORDER BY borrowed_at DESC
@@ -87,22 +84,23 @@ async function getActiveLoan(userId, bookId) {
   return rows[0] || null;
 }
 
-async function getLoanByIdentifier(userId, identifier) {
-  const id = String(identifier || '').trim();
-  if (!id) return null;
-
-  const byLoanId = toRows(
+async function getActiveLoanById(userId, loanId) {
+  const rows = toRows(
     await db.executeQuery(
-      `SELECT id, book_id, borrowed_at, due_date, returned_at
+      `SELECT id, user_id, book_id, borrowed_at,
+              COALESCE(due_date, due_at) AS due_date,
+              due_at,
+              returned_at,
+              status,
+              extended
        FROM loans
        WHERE user_id = $1 AND id = $2 AND returned_at IS NULL
        LIMIT 1`,
-      [userId, id]
+      [userId, loanId]
     )
   );
-  if (byLoanId[0]) return byLoanId[0];
 
-  return getActiveLoan(userId, id);
+  return rows[0] || null;
 }
 
 async function getWishlistRow(userId, bookId) {
@@ -137,7 +135,7 @@ async function getWishlistRowsByUser(userId) {
   try {
     return toRows(
       await db.executeQuery(
-        `SELECT b.id, b.title, b.authors, b.genres, b.cover_id, b.isbn, b.avg_rating, b.year, b.pages,
+        `SELECT b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
                 w.book_id as wishlist_id, w.added_at
          FROM wishlist w
          JOIN books b ON b.id = w.book_id
@@ -150,7 +148,7 @@ async function getWishlistRowsByUser(userId) {
   } catch (_) {
     return toRows(
       await db.executeQuery(
-        `SELECT b.id, b.title, b.authors, b.genres, b.cover_id, b.isbn, b.avg_rating, b.year, b.pages,
+        `SELECT b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
                 w.book_id as wishlist_id, w.created_at AS added_at
          FROM wishlist w
          JOIN books b ON b.id = w.book_id
@@ -164,53 +162,67 @@ async function getWishlistRowsByUser(userId) {
 }
 
 async function ensureReadingSession(userId, bookId) {
+  const existingRows = toRows(
+    await db.executeQuery(
+      `SELECT id
+       FROM reading_sessions
+       WHERE user_id = $1 AND book_id = $2 AND status IN ('reading', 'active')
+       ORDER BY started_at DESC
+       LIMIT 1`,
+      [userId, bookId]
+    )
+  );
+
+  if (existingRows.length > 0) return existingRows[0];
+
+  const bookRows = toRows(
+    await db.executeQuery(
+      'SELECT pages FROM books WHERE id = $1 AND is_active = true LIMIT 1',
+      [bookId]
+    )
+  );
+  const totalPages = Number(bookRows[0]?.pages || 0);
+
+  const initialPage = totalPages > 0 ? 1 : 0;
+
+  const createdRows = toRows(
+    await db.executeQuery(
+      `INSERT INTO reading_sessions
+       (user_id, book_id, current_page, total_pages, progress_percentage, status, started_at, last_read_at)
+       VALUES ($1, $2, $3, $4, 0, 'reading', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       RETURNING id, started_at`,
+      [userId, bookId, initialPage, totalPages]
+    )
+  );
+
+  return createdRows[0] || null;
+}
+
+async function notifyUserAndSendEmail({ userId, type, title, body, bookId = null, emailSubject }) {
+  await insertNotification({ userId, type, title, body, bookId });
+
+  const contact = await getUserContact(userId);
+  if (!contact?.email) return;
+
+  const textBody = [
+    `Halo ${contact.name || 'Pustara Reader'},`,
+    '',
+    body,
+    '',
+    'Buka Pustara untuk detail lebih lanjut.',
+  ].join('\n');
+
   try {
-    const existingRows = toRows(
-      await db.executeQuery(
-        `SELECT id
-         FROM reading_sessions
-         WHERE user_id = $1 AND book_id = $2 AND status IN ('reading', 'active')
-         ORDER BY started_at DESC
-         LIMIT 1`,
-        [userId, bookId]
-      )
-    );
-
-    if (existingRows.length > 0) return existingRows[0];
-
-    const bookRows = toRows(
-      await db.executeQuery(
-        'SELECT pages FROM books WHERE id = $1 AND is_active = true LIMIT 1',
-        [bookId]
-      )
-    );
-    const totalPages = Number(bookRows[0]?.pages || 0);
-
-    const createdRows = toRows(
-      await db.executeQuery(
-        `INSERT INTO reading_sessions
-         (user_id, book_id, current_page, total_pages, progress_percentage, status, started_at, last_read_at)
-         VALUES ($1, $2, 0, $3, 0, 'reading', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-         RETURNING id, started_at`,
-        [userId, bookId, totalPages]
-      )
-    );
-
-    return createdRows[0] || null;
+    await sendEmail({
+      to: contact.email,
+      subject: emailSubject || title,
+      text: textBody,
+    });
   } catch (error) {
-    // reading_sessions table might not exist yet - that's ok, just skip
-    if (error.message?.includes('reading_sessions') || error.message?.includes('does not exist')) {
-      console.warn('ℹ️ reading_sessions table not yet created, skipping session tracking');
-      return null;
-    }
-    throw error;
+    console.warn('[Shelf] Failed to send user email:', error.message);
   }
 }
 
-/**
- * GET /shelf/me/status/:bookId
- * Returns interaction flags for one book.
- */
 exports.getMyBookStatus = async (req, res) => {
   try {
     const actorUserId = await resolveActorUserId(req);
@@ -239,10 +251,6 @@ exports.getMyBookStatus = async (req, res) => {
   }
 };
 
-/**
- * POST /shelf/me/borrow/:bookId
- * Create active loan and reading session.
- */
 exports.borrowBook = async (req, res) => {
   try {
     const actorUserId = await resolveActorUserId(req);
@@ -253,7 +261,7 @@ exports.borrowBook = async (req, res) => {
     const { bookId } = req.params;
     const bookRows = toRows(
       await db.executeQuery(
-        'SELECT id, title, available, total_stock, is_active FROM books WHERE id = $1 LIMIT 1',
+        'SELECT id, title, available, is_active FROM books WHERE id = $1 LIMIT 1',
         [bookId]
       )
     );
@@ -263,7 +271,7 @@ exports.borrowBook = async (req, res) => {
     }
 
     const book = bookRows[0];
-    const available = Number(book.available ?? book.total_stock ?? 0);
+    const available = Number(book.available || 0);
 
     const existingLoan = await getActiveLoan(actorUserId, bookId);
     if (existingLoan) {
@@ -274,7 +282,7 @@ exports.borrowBook = async (req, res) => {
         data: {
           loan_id: String(existingLoan.id),
           borrowed: true,
-          due_date: existingLoan.due_date || null,
+          due_date: existingLoan.due_date || existingLoan.due_at || null,
         },
       });
     }
@@ -288,9 +296,9 @@ exports.borrowBook = async (req, res) => {
 
     const loanRows = toRows(
       await db.executeQuery(
-        `INSERT INTO loans (user_id, book_id, borrowed_at, due_date, returned_at)
+        `INSERT INTO loans (user_id, book_id, borrowed_at, due_at, returned_at)
          VALUES ($1, $2, CURRENT_TIMESTAMP, $3, NULL)
-         RETURNING id, borrowed_at, due_date`,
+         RETURNING id, borrowed_at, COALESCE(due_date, due_at) AS due_date, due_at`,
         [actorUserId, bookId, dueDate]
       )
     );
@@ -302,7 +310,6 @@ exports.borrowBook = async (req, res) => {
 
     await ensureReadingSession(actorUserId, bookId);
 
-    // Feed AI activity stream so this interaction counts toward recommendation phase.
     if (req.user?.uid) {
       pushActivity(req.user.uid, bookId, 'read').catch((err) => {
         console.warn('[Shelf] pushActivity(read) warning:', err?.message || err);
@@ -310,6 +317,16 @@ exports.borrowBook = async (req, res) => {
     }
 
     const loan = loanRows[0] || {};
+
+    await notifyUserAndSendEmail({
+      userId: actorUserId,
+      type: 'borrow',
+      title: 'Peminjaman Berhasil',
+      body: `Buku \"${book.title}\" berhasil dipinjam. Tenggat pengembalian: 7 hari dari sekarang.`,
+      bookId,
+      emailSubject: 'Pustara - Konfirmasi Peminjaman Buku',
+    });
+
     res.status(201).json({
       success: true,
       message: 'Book borrowed successfully',
@@ -317,7 +334,7 @@ exports.borrowBook = async (req, res) => {
         loan_id: loan.id ? String(loan.id) : null,
         borrowed: true,
         borrowed_at: loan.borrowed_at || null,
-        due_date: loan.due_date || dueDate,
+        due_date: loan.due_date || loan.due_at || dueDate,
       },
     });
   } catch (error) {
@@ -326,10 +343,6 @@ exports.borrowBook = async (req, res) => {
   }
 };
 
-/**
- * POST /shelf/me/return/:bookId
- * Close active loan and restore one available stock.
- */
 exports.returnBook = async (req, res) => {
   try {
     const actorUserId = await resolveActorUserId(req);
@@ -337,42 +350,64 @@ exports.returnBook = async (req, res) => {
       return res.status(401).json({ success: false, message: 'Authentication required' });
     }
 
-    const { bookId } = req.params;
-    const activeLoan = await getLoanByIdentifier(actorUserId, bookId);
+    const loanOrBookId = req.params.loanOrBookId || req.params.bookId || req.params.loanId;
+    if (!loanOrBookId) {
+      return res.status(400).json({ success: false, message: 'loanId or bookId is required' });
+    }
+
+    let activeLoan = await getActiveLoanById(actorUserId, loanOrBookId);
+    if (!activeLoan) {
+      activeLoan = await getActiveLoan(actorUserId, loanOrBookId);
+    }
 
     if (!activeLoan) {
       return res.json({
         success: true,
-        message: 'No active loan found for this book',
+        message: 'No active loan found',
         data: { borrowed: false, returned: true },
       });
     }
 
     await db.executeQuery(
       `UPDATE loans
-       SET returned_at = CURRENT_TIMESTAMP
+       SET returned_at = CURRENT_TIMESTAMP, status = 'returned'
        WHERE id = $1 AND user_id = $2 AND returned_at IS NULL`,
       [activeLoan.id, actorUserId]
     );
 
     await db.executeQuery(
-      'UPDATE books SET available = COALESCE(available, 0) + 1 WHERE id = $1',
+      'UPDATE books SET available = LEAST(COALESCE(available, 0) + 1, COALESCE(total_stock, available + 1)) WHERE id = $1',
       [activeLoan.book_id]
     );
 
-    // Pause active reading sessions for this title after the loan is returned.
     await db.executeQuery(
       `UPDATE reading_sessions
-       SET status = 'paused'
-       WHERE user_id = $1 AND book_id = $2 AND status IN ('reading', 'active')`,
+      SET status = 'finished',
+          finished_at = CURRENT_TIMESTAMP
+      WHERE user_id = $1 AND book_id = $2 AND status IN ('reading', 'active', 'paused')`,
       [actorUserId, activeLoan.book_id]
     );
+    
+    const returnedBookRows = toRows(
+      await db.executeQuery('SELECT title FROM books WHERE id = $1 LIMIT 1', [activeLoan.book_id])
+    );
+    const returnedTitle = String(returnedBookRows[0]?.title || 'Buku');
+
+    await notifyUserAndSendEmail({
+      userId: actorUserId,
+      type: 'system',
+      title: 'Pengembalian Berhasil',
+      body: `Buku \"${returnedTitle}\" sudah berhasil dikembalikan. Terima kasih sudah membaca di Pustara.`,
+      bookId: activeLoan.book_id,
+      emailSubject: 'Pustara - Pengembalian Buku Berhasil',
+    });
 
     res.json({
       success: true,
       message: 'Book returned successfully',
       data: {
         loan_id: String(activeLoan.id),
+        book_id: String(activeLoan.book_id || ''),
         borrowed: false,
         returned: true,
       },
@@ -383,10 +418,6 @@ exports.returnBook = async (req, res) => {
   }
 };
 
-/**
- * POST /shelf/me/extend/:loanId
- * Extend due date for an active loan.
- */
 exports.extendLoan = async (req, res) => {
   try {
     const actorUserId = await resolveActorUserId(req);
@@ -395,41 +426,74 @@ exports.extendLoan = async (req, res) => {
     }
 
     const { loanId } = req.params;
-    const activeLoan = await getLoanByIdentifier(actorUserId, loanId);
+    if (!loanId) {
+      return res.status(400).json({ success: false, message: 'loanId is required' });
+    }
 
-    if (!activeLoan) {
+    const loanRows = toRows(
+      await db.executeQuery(
+        `SELECT id, user_id, book_id, returned_at, extended, status,
+                COALESCE(due_date, due_at) AS due_base
+         FROM loans
+         WHERE id = $1 AND user_id = $2
+         LIMIT 1`,
+        [loanId, actorUserId]
+      )
+    );
+
+    const loan = loanRows[0];
+    if (!loan) {
       return res.status(404).json({ success: false, message: 'Loan not found' });
     }
 
-    const currentDueDate = activeLoan.due_date ? new Date(activeLoan.due_date) : new Date();
-    currentDueDate.setDate(currentDueDate.getDate() + 3);
-
-    let rows = [];
-    try {
-      rows = toRows(
-        await db.executeQuery(
-          `UPDATE loans
-           SET due_date = $1, extended = true, status = 'extended'
-           WHERE id = $2 AND user_id = $3 AND returned_at IS NULL
-           RETURNING id, due_date`,
-          [currentDueDate, activeLoan.id, actorUserId]
-        )
-      );
-    } catch (error) {
-      console.error('Error extending loan:', error.message);
-      return res.status(500).json({ success: false, message: 'Failed to extend loan', error: error.message });
+    if (loan.returned_at) {
+      return res.status(409).json({ success: false, message: 'Loan already returned' });
     }
 
-    if (rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Loan not found' });
+    if (Boolean(loan.extended)) {
+      return res.status(409).json({ success: false, message: 'Loan already extended once' });
     }
 
-    res.json({
+    if (String(loan.status || '').toLowerCase() === 'overdue') {
+      return res.status(409).json({ success: false, message: 'Overdue loan cannot be extended' });
+    }
+
+    const updatedRows = toRows(
+      await db.executeQuery(
+        `UPDATE loans
+         SET due_at = COALESCE(due_at, CURRENT_TIMESTAMP) + INTERVAL '3 days',
+             extended = true,
+             status = 'extended'
+         WHERE id = $1 AND user_id = $2 AND returned_at IS NULL
+         RETURNING id, book_id, COALESCE(due_date, due_at) AS due_date, due_at, extended, status`,
+        [loanId, actorUserId]
+      )
+    );
+
+    const updated = updatedRows[0] || null;
+
+    const extendedBookRows = toRows(
+      await db.executeQuery('SELECT title FROM books WHERE id = $1 LIMIT 1', [updated?.book_id || loan.book_id])
+    );
+    const extendedTitle = String(extendedBookRows[0]?.title || 'Buku');
+
+    await notifyUserAndSendEmail({
+      userId: actorUserId,
+      type: 'due',
+      title: 'Peminjaman Diperpanjang',
+      body: `Peminjaman buku \"${extendedTitle}\" diperpanjang 3 hari. Pastikan dikembalikan sebelum tenggat baru.`,
+      bookId: updated?.book_id || loan.book_id,
+      emailSubject: 'Pustara - Perpanjangan Peminjaman',
+    });
+
+    return res.json({
       success: true,
-      message: 'Loan extended successfully',
+      message: 'Loan extended by 3 days',
       data: {
-        loan_id: String(activeLoan.id),
-        due_date: rows[0].due_date || currentDueDate,
+        loan_id: String(updated?.id || loanId),
+        book_id: String(updated?.book_id || loan.book_id || ''),
+        due_date: updated?.due_date || updated?.due_at || null,
+        status: updated?.status || 'extended',
         extended: true,
       },
     });
@@ -439,10 +503,6 @@ exports.extendLoan = async (req, res) => {
   }
 };
 
-/**
- * POST /shelf/me/wishlist/:bookId
- * Add one book to wishlist.
- */
 exports.addToWishlist = async (req, res) => {
   try {
     const actorUserId = await resolveActorUserId(req);
@@ -481,7 +541,6 @@ exports.addToWishlist = async (req, res) => {
       );
     }
 
-    // Feed AI activity stream so wishlist contributes to user interaction count.
     if (req.user?.uid) {
       pushActivity(req.user.uid, bookId, 'wishlist').catch((err) => {
         console.warn('[Shelf] pushActivity(wishlist) warning:', err?.message || err);
@@ -502,10 +561,6 @@ exports.addToWishlist = async (req, res) => {
   }
 };
 
-/**
- * DELETE /shelf/me/wishlist/:bookId
- * Remove one book from wishlist.
- */
 exports.removeFromWishlist = async (req, res) => {
   try {
     const actorUserId = await resolveActorUserId(req);
@@ -529,114 +584,102 @@ exports.removeFromWishlist = async (req, res) => {
 
 /**
  * GET /shelf/me
- * Returns comprehensive shelf data:
- * - pinjaman (borrowed/active loans)
- * - dibaca (currently reading sessions)
- * - riwayat (finished reading sessions)
- * - wishlist (liked books)
+ * Returns comprehensive shelf data with duplicate key fixes.
  */
 exports.getMyShelf = async (req, res) => {
   try {
     const actorUserId = await resolveActorUserId(req);
     if (!actorUserId) {
-      return res.status(401).json({
-        success: false,
-        message: 'Authentication required',
-      });
+      return res.status(401).json({ success: false, message: 'Authentication required' });
     }
 
-    // Query all shelf data in parallel
     const [
       borrowedRows,
       readingNowRows,
       finishedRows,
       wishlistRows,
     ] = await Promise.all([
-      // Active loans (status: 'borrowed' or 'active')
+      // Active loans
       toRows(
         await db.executeQuery(
-          `SELECT b.id, b.title, b.authors, b.genres, b.cover_id, b.isbn, b.avg_rating, b.year, b.pages,
-                  l.id as loan_id, l.borrowed_at, l.due_date, l.returned_at
-           FROM loans l
-           JOIN books b ON b.id = l.book_id
-           WHERE l.user_id = $1
-             AND b.is_active = true
-             AND l.returned_at IS NULL
-           ORDER BY l.borrowed_at DESC`,
+          `SELECT * FROM (
+             SELECT DISTINCT ON (b.id) 
+                    b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
+                    l.id as loan_id, l.borrowed_at, COALESCE(l.due_date, l.due_at) AS due_date, l.returned_at,
+                    COALESCE(rs.progress_percentage, 0) as progress_percentage
+             FROM loans l
+             JOIN books b ON b.id = l.book_id
+             LEFT JOIN LATERAL (
+               SELECT progress_percentage, started_at
+               FROM reading_sessions
+               WHERE book_id = l.book_id AND user_id = l.user_id AND status IN ('reading', 'active', 'paused')
+               ORDER BY started_at DESC LIMIT 1
+             ) rs ON true
+             WHERE l.user_id = $1 AND b.is_active = true AND l.returned_at IS NULL
+             ORDER BY b.id, l.borrowed_at DESC
+           ) sub
+           ORDER BY borrowed_at DESC`,
           [actorUserId]
         )
       ),
-      // Currently reading sessions - with fallback if table doesn't exist
-      (async () => {
-        try {
-          return toRows(
-            await db.executeQuery(
-              `SELECT b.id, b.title, b.authors, b.genres, b.cover_id, b.isbn, b.avg_rating, b.year, b.pages,
-                      rs.id as session_id, rs.current_page, rs.total_pages, 
-                      rs.progress_percentage, rs.last_read_at, rs.started_at
-               FROM reading_sessions rs
-               JOIN books b ON b.id = rs.book_id
-               WHERE rs.user_id = $1
-                 AND b.is_active = true
-                 AND rs.status IN ('reading', 'active')
-               ORDER BY rs.last_read_at DESC`,
-              [actorUserId]
-            )
-          );
-        } catch (err) {
-          if (String(err.message).includes('reading_sessions')) {
-            console.warn('⚠️  reading_sessions table tidak ada - menggunakan fallback kosong');
-            return [];
-          }
-          throw err;
-        }
-      })(),
-      // Finished reading sessions - with fallback if table doesn't exist
-      (async () => {
-        try {
-          return toRows(
-            await db.executeQuery(
-              `SELECT b.id, b.title, b.authors, b.genres, b.cover_id, b.isbn, b.avg_rating, b.year, b.pages,
-                      rs.id as session_id, rs.current_page, rs.total_pages, 
-                      rs.progress_percentage, rs.finished_at, rs.started_at, rs.reading_time_minutes
-               FROM reading_sessions rs
-               JOIN books b ON b.id = rs.book_id
-               WHERE rs.user_id = $1
-                 AND b.is_active = true
-                 AND rs.status = 'finished'
-               ORDER BY rs.finished_at DESC`,
-              [actorUserId]
-            )
-          );
-        } catch (err) {
-          if (String(err.message).includes('reading_sessions')) {
-            console.warn('⚠️  reading_sessions table tidak ada - menggunakan fallback kosong');
-            return [];
-          }
-          throw err;
-        }
-      })(),
-      // Wishlist / liked books
+      // Currently reading sessions
+      toRows(
+        await db.executeQuery(
+          `SELECT * FROM (
+             SELECT DISTINCT ON (b.id) 
+                    b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
+                    rs.id as session_id, rs.current_page, rs.total_pages, 
+                    rs.progress_percentage, rs.last_read_at, rs.started_at
+             FROM reading_sessions rs
+             JOIN books b ON b.id = rs.book_id
+             WHERE rs.user_id = $1
+               AND b.is_active = true
+               AND rs.status IN ('reading', 'active', 'paused')
+               AND EXISTS (
+                 SELECT 1 FROM loans l 
+                 WHERE l.book_id = rs.book_id AND l.user_id = rs.user_id AND l.returned_at IS NULL
+               )
+               AND (rs.current_page > 1 OR rs.progress_percentage > 0)
+             ORDER BY b.id, rs.last_read_at DESC NULLS LAST, rs.started_at DESC
+           ) sub
+           ORDER BY last_read_at DESC NULLS LAST`,
+          [actorUserId]
+        )
+      ),
+      // Finished reading sessions (Riwayat)
+      toRows(
+        await db.executeQuery(
+          `SELECT * FROM (
+             SELECT b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
+                    rs.id as session_id, rs.current_page, rs.total_pages, 
+                    rs.progress_percentage, rs.finished_at, rs.started_at, rs.reading_time_minutes
+             FROM reading_sessions rs
+             JOIN books b ON b.id = rs.book_id
+             WHERE rs.user_id = $1
+               AND b.is_active = true
+               AND rs.status = 'finished'
+             ORDER BY b.id, rs.finished_at DESC NULLS LAST
+           ) sub
+           ORDER BY finished_at DESC NULLS LAST`,
+          [actorUserId]
+        )
+      ),
       getWishlistRowsByUser(actorUserId),
     ]);
 
-    // Format pinjaman (borrowed books)
     const pinjaman = borrowedRows.map((row) => ({
       ...formatBook(row),
       loan_id: String(row.loan_id || ''),
       borrowed_at: row.borrowed_at || null,
       due_date: row.due_date || null,
       returned_at: row.returned_at || null,
-      // Calculate days left
+      progress: Number(row.progress_percentage || 0),
+      progress_percentage: Number(row.progress_percentage || 0),
       days_left: row.due_date
-        ? Math.max(
-            0,
-            Math.floor((new Date(row.due_date) - new Date()) / (1000 * 60 * 60 * 24))
-          )
+        ? Math.max(0, Math.floor((new Date(row.due_date) - new Date()) / (1000 * 60 * 60 * 24)))
         : null,
     }));
 
-    // Format dibaca (currently reading)
     const dibaca = readingNowRows.map((row) => ({
       ...formatBook(row),
       session_id: String(row.session_id || ''),
@@ -647,23 +690,17 @@ exports.getMyShelf = async (req, res) => {
       started_at: row.started_at || null,
     }));
 
-    // Format riwayat (finished reading)
     const riwayat = finishedRows.map((row) => ({
       ...formatBook(row),
       session_id: String(row.session_id || ''),
       finished_at: row.finished_at || null,
       started_at: row.started_at || null,
       reading_time_minutes: Number(row.reading_time_minutes || 0),
-      // Calculate days read
       days_read: row.started_at && row.finished_at
-        ? Math.max(
-            1,
-            Math.floor((new Date(row.finished_at) - new Date(row.started_at)) / (1000 * 60 * 60 * 24))
-          )
+        ? Math.max(1, Math.floor((new Date(row.finished_at) - new Date(row.started_at)) / (1000 * 60 * 60 * 24)))
         : null,
     }));
 
-    // Format wishlist
     const wishlist = wishlistRows.map((row) => ({
       ...formatBook(row),
       wishlist_id: String(row.wishlist_id || ''),

@@ -5,14 +5,25 @@
 
 const { getPool } = require('../config/database');
 const ReadingSessionService = require('../services/readingSessionService');
+const UserService = require('../services/userService');
 
 function normalizeReadingPayload(body = {}) {
   return {
     bookId: body.bookId || body.book_id || null,
     currentPage: body.current_page ?? body.currentPage,
-    readingTimeMinutes: body.reading_time_minutes ?? body.readingTimeMinutes,
+    readingTimeMinutesDelta: body.reading_time_minutes_delta ?? body.readingTimeMinutesDelta ?? body.reading_time_minutes ?? body.readingTimeMinutes,
+    totalPages: body.totalPages ?? body.total_pages ?? body.total_pages_from_request ?? null,
     status: body.status || 'reading',
   };
+}
+
+async function resolveActorUserId(req) {
+  if (!req.user?.uid) return null;
+
+  const actor = await UserService.getUserByUid(req.user.uid);
+  if (!actor.success || !actor.data?.id) return null;
+
+  return String(actor.data.id);
 }
 
 /**
@@ -21,7 +32,10 @@ function normalizeReadingPayload(body = {}) {
  */
 async function startReadingSession(req, res) {
   try {
-    const { uid } = req.user; // From Firebase auth middleware
+    const actorUserId = await resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
     const { bookId } = req.params;
     const { total_pages = 0 } = req.body;
 
@@ -43,7 +57,7 @@ async function startReadingSession(req, res) {
     const existingSession = await pool.query(
       `SELECT id, status FROM reading_sessions 
        WHERE user_id = $1 AND book_id = $2 AND status != 'finished'`,
-      [uid, bookId]
+      [actorUserId, bookId]
     );
 
     if (existingSession.rows.length > 0) {
@@ -55,6 +69,8 @@ async function startReadingSession(req, res) {
     }
 
     // Create new reading session
+    const initialPage = Number(bookTotalPages) > 0 ? 1 : 0;
+
     const result = await pool.query(
       `INSERT INTO reading_sessions 
        (user_id, book_id, current_page, total_pages, status, started_at)
@@ -62,7 +78,7 @@ async function startReadingSession(req, res) {
        RETURNING 
          id, user_id, book_id, current_page, total_pages, 
          progress_percentage, status, started_at, reading_time_minutes`,
-      [uid, bookId, 0, bookTotalPages, 'reading']
+      [actorUserId, bookId, initialPage, bookTotalPages, 'reading']
     );
 
     const session = result.rows[0];
@@ -92,13 +108,25 @@ async function startReadingSession(req, res) {
  */
 async function updateReadingProgress(req, res) {
   try {
-    const { uid } = req.user;
+    const actorUserId = await resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
     const { sessionId } = req.params;
-    const { current_page, reading_time_minutes, status = 'reading' } = req.body;
+    const { current_page, reading_time_minutes_delta, reading_time_minutes, status = 'reading' } = req.body;
 
-    if (current_page === undefined && reading_time_minutes === undefined) {
+    console.debug('[ReadingController] updateReadingProgress payload:', {
+      actorUserId,
+      sessionId,
+      current_page,
+      reading_time_minutes_delta,
+      reading_time_minutes,
+      status,
+    });
+
+    if (current_page === undefined && reading_time_minutes_delta === undefined && reading_time_minutes === undefined) {
       return res.status(400).json({
-        error: 'Must provide current_page and/or reading_time_minutes',
+        error: 'Must provide current_page and/or reading_time_minutes_delta',
       });
     }
 
@@ -109,7 +137,7 @@ async function updateReadingProgress(req, res) {
       `SELECT id, current_page, total_pages, reading_time_minutes
        FROM reading_sessions 
        WHERE id = $1 AND user_id = $2`,
-      [sessionId, uid]
+      [sessionId, actorUserId]
     );
 
     if (sessionCheck.rows.length === 0) {
@@ -117,10 +145,12 @@ async function updateReadingProgress(req, res) {
     }
 
     const session = sessionCheck.rows[0];
-    const newPage = current_page !== undefined ? current_page : session.current_page;
-    const newReadingTime = reading_time_minutes !== undefined 
-      ? reading_time_minutes 
-      : session.reading_time_minutes;
+    const parsedCurrentPage = current_page !== undefined ? Number(current_page) : Number(session.current_page);
+    const newPage = Number.isFinite(parsedCurrentPage) ? parsedCurrentPage : Number(session.current_page) || 0;
+    const readingTimeDelta = reading_time_minutes_delta !== undefined
+      ? Math.max(0, Number(reading_time_minutes_delta) || 0)
+      : (reading_time_minutes !== undefined ? Math.max(0, Number(reading_time_minutes) || 0) : 0);
+    const newReadingTime = (Number(session.reading_time_minutes) || 0) + readingTimeDelta;
 
     // Validate page number
     if (newPage < 0 || newPage > session.total_pages) {
@@ -134,11 +164,13 @@ async function updateReadingProgress(req, res) {
       ? ((newPage / session.total_pages) * 100).toFixed(2)
       : 0;
 
+    const safePage = Math.max(Number(session.current_page) || 0, newPage);
+
     // Update session
     const result = await pool.query(
       `UPDATE reading_sessions 
-       SET current_page = $1,
-           progress_percentage = $2,
+       SET current_page = GREATEST(COALESCE(current_page, 0), $1),
+           progress_percentage = GREATEST(COALESCE(progress_percentage, 0), $2),
            reading_time_minutes = $3,
            status = $4,
            last_read_at = CURRENT_TIMESTAMP
@@ -146,7 +178,7 @@ async function updateReadingProgress(req, res) {
        RETURNING 
          id, book_id, current_page, total_pages, 
          progress_percentage, status, last_read_at, reading_time_minutes`,
-      [newPage, progress, newReadingTime, status, sessionId, uid]
+      [safePage, progress, newReadingTime, status, sessionId, actorUserId]
     );
 
     const updatedSession = result.rows[0];
@@ -176,7 +208,10 @@ async function updateReadingProgress(req, res) {
  */
 async function finishReadingSession(req, res) {
   try {
-    const { uid } = req.user;
+    const actorUserId = await resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
     const { sessionId } = req.params;
 
     const pool = getPool();
@@ -185,7 +220,7 @@ async function finishReadingSession(req, res) {
     const sessionCheck = await pool.query(
       `SELECT id, status FROM reading_sessions 
        WHERE id = $1 AND user_id = $2`,
-      [sessionId, uid]
+      [sessionId, actorUserId]
     );
 
     if (sessionCheck.rows.length === 0) {
@@ -206,7 +241,7 @@ async function finishReadingSession(req, res) {
        RETURNING 
          id, book_id, current_page, total_pages, 
          progress_percentage, status, started_at, finished_at, reading_time_minutes`,
-      [sessionId, uid]
+      [sessionId, actorUserId]
     );
 
     const finishedSession = result.rows[0];
@@ -237,15 +272,27 @@ async function finishReadingSession(req, res) {
  */
 async function updateReadingProgressByBook(req, res) {
   try {
-    const { uid } = req.user;
-    const { bookId, currentPage, readingTimeMinutes, status } = normalizeReadingPayload(req.body);
+    const actorUserId = await resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    const { bookId, currentPage, readingTimeMinutesDelta, readingTimeMinutes, status, totalPages } = normalizeReadingPayload(req.body);
+
+    console.debug('[ReadingController] updateReadingProgressByBook payload:', {
+      actorUserId,
+      bookId,
+      currentPage,
+      readingTimeMinutes,
+      totalPages,
+      status,
+    });
 
     if (!bookId) {
       return res.status(400).json({ error: 'bookId is required' });
     }
 
-    if (status === 'paused' && currentPage === undefined && readingTimeMinutes === undefined) {
-      const pausedResult = await ReadingSessionService.pauseReading(uid, bookId);
+    if (status === 'paused' && currentPage === undefined && readingTimeMinutesDelta === undefined && readingTimeMinutes === undefined) {
+      const pausedResult = await ReadingSessionService.pauseReading(actorUserId, bookId);
       if (!pausedResult.success) {
         return res.status(400).json({ error: pausedResult.message });
       }
@@ -256,7 +303,8 @@ async function updateReadingProgressByBook(req, res) {
       });
     }
 
-    const result = await ReadingSessionService.updateReadingProgress(uid, bookId, currentPage, readingTimeMinutes);
+    const timeDelta = readingTimeMinutesDelta !== undefined ? readingTimeMinutesDelta : readingTimeMinutes;
+    const result = await ReadingSessionService.updateReadingProgress(actorUserId, bookId, currentPage, timeDelta, totalPages);
 
     if (!result.success) {
       return res.status(400).json({ error: result.message });
@@ -278,14 +326,17 @@ async function updateReadingProgressByBook(req, res) {
  */
 async function finishReadingByBook(req, res) {
   try {
-    const { uid } = req.user;
+    const actorUserId = await resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
     const { bookId } = normalizeReadingPayload(req.body);
 
     if (!bookId) {
       return res.status(400).json({ error: 'bookId is required' });
     }
 
-    const result = await ReadingSessionService.finishReading(uid, bookId);
+    const result = await ReadingSessionService.finishReading(actorUserId, bookId);
 
     if (!result.success) {
       return res.status(400).json({ error: result.message });
@@ -307,14 +358,17 @@ async function finishReadingByBook(req, res) {
  */
 async function pauseReadingByBook(req, res) {
   try {
-    const { uid } = req.user;
+    const actorUserId = await resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
     const { bookId } = normalizeReadingPayload(req.body);
 
     if (!bookId) {
       return res.status(400).json({ error: 'bookId is required' });
     }
 
-    const result = await ReadingSessionService.pauseReading(uid, bookId);
+    const result = await ReadingSessionService.pauseReading(actorUserId, bookId);
 
     if (!result.success) {
       return res.status(400).json({ error: result.message });
@@ -336,7 +390,10 @@ async function pauseReadingByBook(req, res) {
  */
 async function getUserSessions(req, res) {
   try {
-    const { uid } = req.user;
+    const actorUserId = await resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
     const { status = 'reading', limit = 10, offset = 0 } = req.query;
 
     const pool = getPool();
@@ -352,7 +409,7 @@ async function getUserSessions(req, res) {
       WHERE rs.user_id = $1
     `;
 
-    const params = [uid];
+    const params = [actorUserId];
 
     if (status) {
       query += ` AND rs.status = $${params.length + 1}`;
@@ -380,7 +437,10 @@ async function getUserSessions(req, res) {
  */
 async function getSessionDetails(req, res) {
   try {
-    const { uid } = req.user;
+    const actorUserId = await resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
     const { sessionId } = req.params;
 
     const pool = getPool();
@@ -394,7 +454,7 @@ async function getSessionDetails(req, res) {
        FROM reading_sessions rs
        JOIN books b ON rs.book_id = b.id
        WHERE rs.id = $1 AND rs.user_id = $2`,
-      [sessionId, uid]
+      [sessionId, actorUserId]
     );
 
     if (result.rows.length === 0) {

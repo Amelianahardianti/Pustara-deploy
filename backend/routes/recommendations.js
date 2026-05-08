@@ -175,59 +175,19 @@ async function proxyToAI(method, path, body = null) {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${process.env.HF_TOKEN}`,
     },
-    timeout: 10000, // 10 second timeout
   };
   if (body) options.body = JSON.stringify(body);
 
-  // 🔍 DEBUG: Log exact URL and timing
-  const startTime = Date.now();
-  console.log(`\n[AI Proxy START] ${method} → ${url}`);
-  console.log(`[AI Proxy] Timeout: 10000ms | FastAPI URL: ${getAiUrl()}`);
-  
-  try {
-    const response = await fetch(url, options);
-    
-    // Check if response is JSON
-    const contentType = response.headers.get('content-type');
-    if (!contentType || !contentType.includes('application/json')) {
-      const text = await response.text();
-      console.error(`[AI Proxy] Non-JSON response (${response.status}):`, text.substring(0, 200));
-      const err = new Error(`AI service returned non-JSON response (status: ${response.status}). Service may be unreachable.`);
-      err.status = response.status;
-      throw err;
-    }
+  console.log(`[AI Proxy] ${method} → ${url}`);
+  const response = await fetch(url, options);
+  const data     = await response.json();
 
-    const data = await response.json();
-
-    if (!response.ok) {
-      const err = new Error(data.detail || `AI service error: ${response.status}`);
-      err.status = response.status;
-      throw err;
-    }
-    
-    return data;
-  } catch (error) {
-    // Handle specific error types
-    if (error instanceof TypeError && error.message.includes('fetch')) {
-      // Network error
-      console.error(`[AI Proxy] Network/Connection Error:`, error.message);
-      throw new Error(`Cannot reach AI service at ${getAiUrl()}. Service may be down.`);
-    }
-    
-    if (error instanceof SyntaxError && error.message.includes('JSON')) {
-      console.error(`[AI Proxy] JSON parse error:`, error.message);
-      throw new Error('AI service response is not valid JSON. Service may be down.');
-    }
-    
-    if (error.name === 'AbortError') {
-      console.error(`[AI Proxy] Request timeout after 10s`);
-      throw new Error('AI service request timed out (10s). Service may be slow or unresponsive.');
-    }
-
-    // Re-throw dengan context
-    console.error(`[AI Proxy] Unhandled error:`, error.message);
-    throw error;
+  if (!response.ok) {
+    const err = new Error(data.detail || `AI service error: ${response.status}`);
+    err.status = response.status;
+    throw err;
   }
+  return data;
 }
 
 /**
@@ -436,50 +396,17 @@ function createRecommendationsRoutes(verifyTokenMiddleware, optionalVerifyTokenM
     '/trending',
     optionalVerifyTokenMiddleware,
     asyncHandler(async (req, res) => {
-      const requestId = `[REC-TRENDING-${Date.now()}]`;
+      const { top_n = 10 } = req.query;
+      const uid = req.user?.uid;
+      const surveyCtx = uid ? await getUserSurveyContext(uid) : {};
+
+      const params = new URLSearchParams({ n: top_n, top_n: top_n });
       
-      try {
-        // 🔍 DEBUG: Verify this endpoint is called
-        console.log(`\n╔════════════════════════════════════════════════════════════╗`);
-        console.log(`║ [EXEC] recommendations /trending endpoint CALLED          ║`);
-        console.log(`║ Source: backend/routes/recommendations.js line 432       ║`);
-        console.log(`║ Type: FETCH TO FastAPI (will call proxyToAI)             ║`);
-        console.log(`║ FastAPI URL: ${getAiUrl()}                  ║`);
-        console.log(`╚════════════════════════════════════════════════════════════╝`);
-        console.log(`${requestId} Starting recommendations/trending request`);
-        
-        const { top_n = 10 } = req.query;
-        const uid = req.user?.uid;
-        const surveyCtx = uid ? await getUserSurveyContext(uid) : {};
+      if (surveyCtx.user_gender) params.set('gender', surveyCtx.user_gender);
+      if (surveyCtx.user_age_group) params.set('age_group', surveyCtx.user_age_group);
 
-        const params = new URLSearchParams({ n: top_n, top_n: top_n });
-        
-        if (surveyCtx.user_gender) params.set('gender', surveyCtx.user_gender);
-        if (surveyCtx.user_age_group) params.set('age_group', surveyCtx.user_age_group);
-
-        console.log(`${requestId} Calling proxyToAI...`);
-        const result = await proxyToAI('GET', `/recommendations/trending?${params.toString()}`);
-        console.log(`${requestId} ✅ AI Proxy succeeded`);
-        
-        res.json({ success: true, data: normalizeTrendingPayload(result) });
-      } catch (err) {
-        console.error(`${requestId} ⚠️  AI Proxy failed - returning graceful fallback:`, err.message);
-        
-        // Fallback: return empty recommendations dengan 200 status
-        // Client dapat response yang valid meski AI service down
-        res.status(200).json({
-          success: true, // Success pero empty data
-          data: {
-            trending: [],
-            recommendations: [],
-          },
-          meta: {
-            source: 'fallback',
-            reason: 'AI service temporarily unavailable',
-            timestamp: new Date().toISOString(),
-          },
-        });
-      }
+      const result = await proxyToAI('GET', `/recommendations/trending?${params.toString()}`);
+      res.json({ success: true, data: normalizeTrendingPayload(result) });
     })
   );
 

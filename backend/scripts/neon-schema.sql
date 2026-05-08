@@ -51,6 +51,23 @@ CREATE TABLE IF NOT EXISTS books (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_books_stock_non_negative'
+    ) THEN
+        ALTER TABLE books
+            ADD CONSTRAINT chk_books_stock_non_negative CHECK (total_stock >= 0 AND available >= 0);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_books_available_within_total'
+    ) THEN
+        ALTER TABLE books
+            ADD CONSTRAINT chk_books_available_within_total CHECK (available <= total_stock);
+    END IF;
+END $$;
+
 CREATE INDEX idx_books_title ON books(title);
 
 -- =========================================
@@ -78,6 +95,7 @@ CREATE TABLE IF NOT EXISTS loans (
     book_id UUID NOT NULL,
     borrowed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     due_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP + INTERVAL '7 days',
+    due_date TIMESTAMP,
     returned_at TIMESTAMP,
     extended BOOLEAN DEFAULT false,
     status VARCHAR(50) DEFAULT 'active' NOT NULL,
@@ -89,6 +107,7 @@ CREATE TABLE IF NOT EXISTS loans (
 CREATE INDEX idx_loans_user_id ON loans(user_id);
 CREATE INDEX idx_loans_book_id ON loans(book_id);
 CREATE INDEX idx_loans_status ON loans(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_loans_active_unique ON loans(user_id, book_id) WHERE returned_at IS NULL;
 
 -- =========================================
 -- READING SESSIONS TABLE

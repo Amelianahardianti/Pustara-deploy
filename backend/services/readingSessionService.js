@@ -12,7 +12,7 @@ const db = require('../config/database');
  * 2. Calculated percentage (otomatis dari current_page/total_pages)
  * 3. Reading time (berapa lama sudah baca)
  */
-exports.updateReadingProgress = async (userId, bookId, currentPage, readingTimeMinutes) => {
+exports.updateReadingProgress = async (userId, bookId, currentPage, readingTimeMinutesDelta, totalPagesFromRequest) => {
   try {
     const pool = require('../config/database').getPool();
 
@@ -26,45 +26,74 @@ exports.updateReadingProgress = async (userId, bookId, currentPage, readingTimeM
       return { success: false, message: 'Buku tidak ditemukan' };
     }
 
-    const totalPages = parseInt(bookResult.rows[0].pages) || 0;
-    const validCurrentPage = Math.min(parseInt(currentPage) || 0, totalPages);
-    const progressPercentage = totalPages > 0 
-      ? Math.round((validCurrentPage / totalPages) * 100) 
+    const bookTotalPages = parseInt(bookResult.rows[0].pages) || 0;
+    const totalPages = bookTotalPages > 0 ? bookTotalPages : (parseInt(totalPagesFromRequest) || 0);
+
+    if (totalPages > 0 && bookTotalPages === 0) {
+      await pool.query(
+        'UPDATE books SET pages = $1 WHERE id = $2 AND (pages IS NULL OR pages = 0)',
+        [totalPages, bookId]
+      );
+    }
+    
+    const parsedPage = parseInt(currentPage);
+    const pageNum = isNaN(parsedPage) ? null : parsedPage;
+    const validCurrentPage = totalPages > 0
+      ? Math.min(Math.max(pageNum || 1, 1), totalPages)
+      : (pageNum || 0);
+    const progressPercentage = totalPages > 0
+      ? Math.round((validCurrentPage / totalPages) * 100)
       : 0;
 
-    // Check if session exists
+    // Check if session exists (only non-finished ones — finished sessions are riwayat and must be preserved)
     const existingResult = await pool.query(
       `SELECT id, reading_time_minutes FROM reading_sessions 
-       WHERE user_id = $1 AND book_id = $2`,
+       WHERE user_id = $1 AND book_id = $2 AND status != 'finished'`,
       [userId, bookId]
     );
 
     const now = new Date();
 
+    console.debug('[ReadingService] updateReadingProgress called with:', {
+      userId,
+      bookId,
+      currentPage: pageNum,
+      readingTimeMinutesDelta,
+      totalPages,
+    });
+
     if (existingResult.rows.length > 0) {
       // Update existing session
       const session = existingResult.rows[0];
-      const newReadingTime = (parseInt(session.reading_time_minutes) || 0) + (readingTimeMinutes || 0);
+      console.debug('[ReadingService] existing session found:', { id: session.id, reading_time_minutes: session.reading_time_minutes });
+      const newReadingTime = (parseInt(session.reading_time_minutes) || 0) + Math.max(0, Number(readingTimeMinutesDelta) || 0);
+      const safeCurrentPage = Math.max(parseInt(session.current_page) || 0, validCurrentPage);
+      const safeProgressPercentage = totalPages > 0
+        ? Math.round((safeCurrentPage / totalPages) * 100)
+        : progressPercentage;
 
       const updateResult = await pool.query(
         `UPDATE reading_sessions
-         SET current_page = $1,
-             progress_percentage = $2,
+         SET current_page = GREATEST(COALESCE(current_page, 0), $1),
+             total_pages = CASE WHEN total_pages = 0 THEN $5 ELSE GREATEST(total_pages, $5) END,
+             progress_percentage = GREATEST(COALESCE(progress_percentage, 0), $2),
              last_read_at = $3,
              reading_time_minutes = $4,
              status = CASE
                WHEN $2 >= 100 THEN 'finished'
                ELSE 'reading'
              END
-         WHERE user_id = $5 AND book_id = $6
+         WHERE user_id = $6 AND book_id = $7 AND status != 'finished'
          RETURNING *`,
-        [validCurrentPage, progressPercentage, now, newReadingTime, userId, bookId]
+        [safeCurrentPage, safeProgressPercentage, now, newReadingTime, totalPages, userId, bookId]
       );
+
+      console.debug('[ReadingService] updated session result:', updateResult.rows[0]);
 
       return {
         success: true,
         data: updateResult.rows[0],
-        message: `Progress update: ${validCurrentPage}/${totalPages} halaman (${progressPercentage}%)`,
+        message: `Progress update: ${safeCurrentPage}/${totalPages} halaman (${safeProgressPercentage}%)`,
       };
     } else {
       // Create new session
@@ -73,8 +102,10 @@ exports.updateReadingProgress = async (userId, bookId, currentPage, readingTimeM
          (user_id, book_id, current_page, total_pages, progress_percentage, started_at, last_read_at, reading_time_minutes, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'reading')
          RETURNING *`,
-        [userId, bookId, validCurrentPage, totalPages, progressPercentage, now, now, readingTimeMinutes || 0]
+        [userId, bookId, validCurrentPage, totalPages, progressPercentage, now, now, Math.max(0, Number(readingTimeMinutesDelta) || 0)]
       );
+
+      console.debug('[ReadingService] created session result:', createResult.rows[0]);
 
       return {
         success: true,
@@ -100,7 +131,7 @@ exports.finishReading = async (userId, bookId) => {
     const result = await pool.query(
       `UPDATE reading_sessions
        SET status = 'finished', finished_at = $1, progress_percentage = 100
-       WHERE user_id = $2 AND book_id = $3
+       WHERE user_id = $2 AND book_id = $3 AND status != 'finished'
        RETURNING *`,
       [finishedAt, userId, bookId]
     );
@@ -130,7 +161,7 @@ exports.pauseReading = async (userId, bookId) => {
     const result = await pool.query(
       `UPDATE reading_sessions
        SET status = 'paused'
-       WHERE user_id = $1 AND book_id = $2
+       WHERE user_id = $1 AND book_id = $2 AND status != 'finished'
        RETURNING *`,
       [userId, bookId]
     );
@@ -162,7 +193,7 @@ exports.resumeReading = async (userId, bookId) => {
     const result = await pool.query(
       `UPDATE reading_sessions
        SET status = 'reading', last_read_at = $1
-       WHERE user_id = $2 AND book_id = $3
+       WHERE user_id = $2 AND book_id = $3 AND status != 'finished'
        RETURNING *`,
       [now, userId, bookId]
     );

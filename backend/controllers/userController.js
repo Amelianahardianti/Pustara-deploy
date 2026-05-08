@@ -85,6 +85,19 @@ function toHandle(value, fallbackId) {
   return `pustara_${toShortId(fallbackId)}`;
 }
 
+/**
+ * Normalize username candidate to match frontend register flow exactly.
+ */
+function normalizeUsernameCandidate(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_\-\s.]/g, ' ')
+    .replace(/[.\-\s]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
 function toDisplayName(value, fallbackId) {
   const text = toNonEmptyString(value);
   if (text && !looksGeneratedHandle(text)) return text;
@@ -414,30 +427,18 @@ exports.getMyProfile = async (req, res) => {
 
 exports.checkUsernameAvailability = async (req, res) => {
   try {
-    const rawUsername = typeof req.query?.username === 'string' ? req.query.username.trim() : '';
-    const normalizedUsername = rawUsername
-      .toLowerCase()
-      .replace(/[^a-z0-9_\-\s.]/g, ' ')
-      .replace(/[.\-\s]+/g, '_')
-      .replace(/_+/g, '_')
-      .replace(/^_+|_+$/g, '');
+    const rawUsername = typeof req.query?.username === 'string' ? req.query.username : '';
+    const normalizedUsername = normalizeUsernameCandidate(rawUsername);
 
-    if (!normalizedUsername) {
-      return res.status(400).json({
-        success: false,
+    if (!normalizedUsername || normalizedUsername.length < 3) {
+      return res.json({
+        success: true,
         available: false,
-        message: 'Username wajib diisi.',
+        message: 'Username terlalu pendek (min. 3 karakter).'
       });
     }
 
-    if (normalizedUsername.length < 3 || normalizedUsername.length > 24) {
-      return res.status(400).json({
-        success: false,
-        available: false,
-        message: 'Username harus 3-24 karakter.',
-      });
-    }
-
+    // Query ke Neon DB
     const rows = toRows(
       await db.executeQuery(
         'SELECT id FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1',
@@ -449,14 +450,15 @@ exports.checkUsernameAvailability = async (req, res) => {
       success: true,
       available: rows.length === 0,
       username: normalizedUsername,
-      message: rows.length === 0 ? 'Username tersedia.' : 'Username sudah digunakan.',
+      normalizedUsername,
+      message: rows.length === 0 ? 'Username tersedia.' : 'Username sudah digunakan.'
     });
   } catch (error) {
     console.error('Error checking username availability:', error.message);
     return res.status(500).json({
       success: false,
       available: false,
-      message: 'Gagal memeriksa username.',
+      message: 'Gagal memeriksa username.'
     });
   }
 };
@@ -485,12 +487,7 @@ exports.updateMyProfile = async (req, res) => {
     }
 
     if (typeof req.body?.username === 'string') {
-      const normalizedUsername = inputUsername
-        .toLowerCase()
-        .replace(/[^a-z0-9_\-\s.]/g, ' ')
-        .replace(/[.\-\s]+/g, '_')
-        .replace(/_+/g, '_')
-        .replace(/^_+|_+$/g, '');
+      const normalizedUsername = normalizeUsernameCandidate(inputUsername);
 
       if (!normalizedUsername || normalizedUsername.length < 3 || normalizedUsername.length > 24) {
         return res.status(400).json({

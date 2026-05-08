@@ -91,6 +91,7 @@ CREATE TABLE [dbo].[loans] (
     [book_id] UNIQUEIDENTIFIER NOT NULL,
     [borrowed_at] DATETIME2 DEFAULT GETDATE(),
     [due_at] DATETIME2 DEFAULT DATEADD(DAY, 7, GETDATE()),
+    [due_date] DATETIME2,
     [returned_at] DATETIME2,
     [extended] BIT DEFAULT 0,
     [status] NVARCHAR(50) DEFAULT 'active' NOT NULL,
@@ -217,23 +218,29 @@ CREATE TABLE [dbo].[wishlist] (
 );
 
 -- =========================================
--- READING SESSIONS TABLE (Optional, untuk tracking)
+-- READING SESSIONS TABLE
 -- =========================================
 CREATE TABLE [dbo].[reading_sessions] (
     [id] UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
     [user_id] UNIQUEIDENTIFIER NOT NULL,
     [book_id] UNIQUEIDENTIFIER NOT NULL,
-    [start_time] DATETIME2 DEFAULT GETDATE(),
-    [end_time] DATETIME2,
-    [pages_read] INT DEFAULT 0,
-    [duration_minutes] INT,
+    [current_page] INT DEFAULT 0,
+    [total_pages] INT DEFAULT 0,
+    [progress_percentage] NUMERIC(5, 2) DEFAULT 0,
+    [reading_time_minutes] INT DEFAULT 0,
+    [status] NVARCHAR(50) DEFAULT 'reading' NOT NULL,
+    [started_at] DATETIME2 DEFAULT GETDATE(),
+    [last_read_at] DATETIME2 DEFAULT GETDATE(),
+    [finished_at] DATETIME2,
     [created_at] DATETIME2 DEFAULT GETDATE(),
+    CONSTRAINT [chk_reading_sessions_status] CHECK ([status] IN ('reading', 'paused', 'finished', 'active')),
     CONSTRAINT [fk_session_user] FOREIGN KEY ([user_id]) REFERENCES [dbo].[users]([id]) ON DELETE CASCADE,
     CONSTRAINT [fk_session_book] FOREIGN KEY ([book_id]) REFERENCES [dbo].[books]([id]) ON DELETE CASCADE
 );
 
 CREATE INDEX [idx_session_user_id] ON [dbo].[reading_sessions]([user_id]);
 CREATE INDEX [idx_session_book_id] ON [dbo].[reading_sessions]([book_id]);
+CREATE INDEX [idx_session_status] ON [dbo].[reading_sessions]([status]);
 
 -- =========================================
 -- Done!

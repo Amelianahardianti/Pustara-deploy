@@ -41,22 +41,12 @@ function parseStringArray(value) {
 }
 
 function formatBook(row) {
-  // Generate cover URL from cover_id or isbn (don't query cover_url column, it doesn't exist)
-  let coverUrl = '';
-  if (row.cover_id) {
-    coverUrl = `https://covers.openlibrary.org/b/id/${row.cover_id}-M.jpg`;
-  } else if (row.isbn) {
-    coverUrl = `https://covers.openlibrary.org/b/isbn/${String(row.isbn).replace(/[-\s]/g, '')}-M.jpg`;
-  }
-
   return {
     id: String(row.id || ''),
     title: String(row.title || ''),
     authors: parseStringArray(row.authors),
     genres: parseStringArray(row.genres),
-    cover_url: coverUrl,
-    cover_id: row.cover_id || null,
-    isbn: row.isbn || null,
+    cover_url: row.cover_url ? String(row.cover_url) : '',
     avg_rating: Number(row.avg_rating || 0),
     year: Number(row.year || 0),
     pages: Number(row.pages || 0),
@@ -78,7 +68,7 @@ async function fetchActivityRows(actorUserId, limit, includeNetwork = false) {
     : `= $1`;
 
   const readingQuery = `SELECT
-      b.id, b.title, b.authors, b.genres, b.cover_id, b.isbn, b.avg_rating, b.year, b.pages,
+      b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
       rs.id as session_id, rs.status, rs.current_page, rs.total_pages,
       rs.progress_percentage, rs.started_at, rs.finished_at, rs.last_read_at,
       rs.reading_time_minutes,
@@ -92,7 +82,7 @@ async function fetchActivityRows(actorUserId, limit, includeNetwork = false) {
       AND rs.status IN ('reading', 'active', 'finished')`;
 
   const wishlistQueryAddedAt = `SELECT
-      b.id, b.title, b.authors, b.genres, b.cover_id, b.isbn, b.avg_rating, b.year, b.pages,
+      b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
       NULL AS session_id, 'wishlist' AS status,
       0 AS current_page, 0 AS total_pages,
       0 AS progress_percentage,
@@ -107,7 +97,7 @@ async function fetchActivityRows(actorUserId, limit, includeNetwork = false) {
       AND b.is_active = true`;
 
   const wishlistQueryCreatedAt = `SELECT
-      b.id, b.title, b.authors, b.genres, b.cover_id, b.isbn, b.avg_rating, b.year, b.pages,
+      b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
       NULL AS session_id, 'wishlist' AS status,
       0 AS current_page, 0 AS total_pages,
       0 AS progress_percentage,
@@ -133,17 +123,8 @@ async function fetchActivityRows(actorUserId, limit, includeNetwork = false) {
 
   try {
     return toRows(await db.executeQuery(unionQuery(wishlistQueryAddedAt), [actorUserId, limit]));
-  } catch (error) {
-    // If reading_sessions table doesn't exist, just return wishlist events
-    if (error.message?.includes('reading_sessions') || error.message?.includes('does not exist')) {
-      console.warn('ℹ️ reading_sessions table not yet created, returning only wishlist activities');
-      try {
-        return toRows(await db.executeQuery(wishlistQueryAddedAt + ` ORDER BY event_time DESC LIMIT $2`, [actorUserId, limit]));
-      } catch (_) {
-        return toRows(await db.executeQuery(wishlistQueryCreatedAt + ` ORDER BY event_time DESC LIMIT $2`, [actorUserId, limit]));
-      }
-    }
-    throw error;
+  } catch (_) {
+    return toRows(await db.executeQuery(unionQuery(wishlistQueryCreatedAt), [actorUserId, limit]));
   }
 }
 
@@ -221,28 +202,54 @@ exports.getMyNotifications = async (req, res) => {
 
     const limit = Math.min(Number(req.query.limit) || 20, 100);
 
-    // Query notifications
-    const notificationRows = toRows(
-      await db.executeQuery(
-        `SELECT 
-           id, user_id, type, title, description, related_user_id, related_book_id,
-           is_read, created_at, updated_at
-         FROM notifications
-         WHERE user_id = $1
-         ORDER BY created_at DESC
-         LIMIT $2`,
-        [actorUserId, limit]
-      )
-    );
+    let notificationRows = [];
+    try {
+      notificationRows = toRows(
+        await db.executeQuery(
+          `SELECT
+             id, user_id, type, title,
+             body, message,
+             book_id, related_book_id,
+             actor_id, related_user_id,
+             read, is_read,
+             created_at
+           FROM notifications
+           WHERE user_id = $1
+           ORDER BY created_at DESC
+           LIMIT $2`,
+          [actorUserId, limit]
+        )
+      );
+    } catch (_) {
+      notificationRows = toRows(
+        await db.executeQuery(
+          `SELECT TOP 100
+             id, user_id, type, title,
+             body, message,
+             book_id, related_book_id,
+             actor_id, related_user_id,
+             read, is_read,
+             created_at
+           FROM notifications
+           WHERE user_id = $1
+           ORDER BY created_at DESC`,
+          [actorUserId]
+        )
+      ).slice(0, limit);
+    }
 
     const notifications = notificationRows.map((row) => ({
       id: String(row.id || ''),
       type: String(row.type || 'info'),
       title: String(row.title || ''),
-      description: String(row.description || ''),
-      related_user_id: row.related_user_id ? String(row.related_user_id) : null,
-      related_book_id: row.related_book_id ? String(row.related_book_id) : null,
-      is_read: Boolean(row.is_read),
+      body: String(row.body || row.message || ''),
+      description: String(row.body || row.message || ''),
+      actor_id: row.actor_id ? String(row.actor_id) : row.related_user_id ? String(row.related_user_id) : null,
+      book_id: row.book_id ? String(row.book_id) : row.related_book_id ? String(row.related_book_id) : null,
+      related_user_id: row.related_user_id ? String(row.related_user_id) : row.actor_id ? String(row.actor_id) : null,
+      related_book_id: row.related_book_id ? String(row.related_book_id) : row.book_id ? String(row.book_id) : null,
+      read: Boolean(row.read ?? row.is_read),
+      is_read: Boolean(row.is_read ?? row.read),
       created_at: row.created_at || null,
       timestamp: row.created_at || null,
     }));
@@ -280,46 +287,23 @@ exports.getMyRecommendations = async (req, res) => {
 
     const limit = Math.min(Number(req.query.limit) || 10, 50);
 
-    // Get recommended users - try with reading_sessions first
-    let recommendedUserRows = [];
-    try {
-      recommendedUserRows = toRows(
-        await db.executeQuery(
-          `SELECT u.id, u.display_name, u.username, u.avatar_url, u.bio,
-                  COUNT(DISTINCT rs.book_id) as books_count
-           FROM users u
-           LEFT JOIN reading_sessions rs ON rs.user_id = u.id AND rs.status IN ('reading', 'finished')
-           WHERE u.id <> $1
-             AND u.id NOT IN (
-               SELECT following_id FROM follows WHERE follower_id = $1
-             )
-           GROUP BY u.id
-           ORDER BY books_count DESC, u.created_at DESC
-           LIMIT $2`,
-          [actorUserId, limit]
-        )
-      );
-    } catch (dbError) {
-      if (dbError.message?.includes('reading_sessions') || dbError.message?.includes('does not exist')) {
-        console.warn('ℹ️ reading_sessions table not yet created, returning users without activity count');
-        // Fallback: return users without reading sessions count
-        recommendedUserRows = toRows(
-          await db.executeQuery(
-            `SELECT u.id, u.display_name, u.username, u.avatar_url, u.bio, 0 as books_count
-             FROM users u
-             WHERE u.id <> $1
-               AND u.id NOT IN (
-                 SELECT following_id FROM follows WHERE follower_id = $1
-               )
-             ORDER BY u.created_at DESC
-             LIMIT $2`,
-            [actorUserId, limit]
-          )
-        );
-      } else {
-        throw dbError;
-      }
-    }
+    // Get recommended users
+    const recommendedUserRows = toRows(
+      await db.executeQuery(
+        `SELECT u.id, u.display_name, u.username, u.avatar_url, u.bio,
+                COUNT(DISTINCT rs.book_id) as books_count
+         FROM users u
+         LEFT JOIN reading_sessions rs ON rs.user_id = u.id AND rs.status IN ('reading', 'finished')
+         WHERE u.id <> $1
+           AND u.id NOT IN (
+             SELECT following_id FROM follows WHERE follower_id = $1
+           )
+         GROUP BY u.id
+         ORDER BY books_count DESC, u.created_at DESC
+         LIMIT $2`,
+        [actorUserId, limit]
+      )
+    );
 
     const recommendations = {
       users: recommendedUserRows.map((row) => ({

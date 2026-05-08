@@ -1,24 +1,4 @@
 services:
-  # PUSTARA Frontend Service
-  pustara-frontend:
-    build:
-      context: ../pustara-fe
-      dockerfile: ./Dockerfile
-    container_name: pustara-frontend
-    ports:
-      - "3001:3001"
-    environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:3000
-      - NODE_ENV=production
-    volumes:
-      - ../pustara-fe:/app:delegated
-      - /app/node_modules
-      - /app/.next
-    depends_on:
-      - pustara-backend
-    restart: always
-
-  # PUSTARA Backend Service
   pustara-backend:
     build:
       context: .
@@ -29,15 +9,14 @@ services:
     env_file:
       - ./backend/.env
     environment:
-      - NODE_ENV=${NODE_ENV}
-      - NEON_CLOUD_MODE=${NEON_CLOUD_MODE}
-      - FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID}
-      - FIREBASE_API_KEY=${FIREBASE_API_KEY}
-      - PORT=${PORT}
-    volumes:
-      # Mount only source code, preserve node_modules from build
-      - ./backend:/app:delegated
-      # Keep node_modules from docker build
-      - /app/node_modules
-    command: npm run dev
-    restart: always
+      - NODE_ENV=${NODE_ENV:-neon}
+      - NEON_CLOUD_MODE=${NEON_CLOUD_MODE:-true}
+      - PORT=${PORT:-3000}
+    command: npm start
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then((r)=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped

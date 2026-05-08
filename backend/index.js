@@ -11,20 +11,12 @@
  * - routes/     : API routes
  */
 
-console.log('[STARTUP]', new Date().toISOString(), 'index.js loaded');
-const fs = require('fs');
-fs.writeFileSync('./debug-requests.log', `[${new Date().toISOString()}] === BACKEND STARTED ===\n`);
-
-// Log that we're about to define the "app" routes
-fs.appendFileSync('./debug-requests.log', `[${new Date().toISOString()}] Defining app routes...\n`);
-
 // CRITICAL: Polyfill global crypto for @typespec/ts-http-runtime
 if (typeof global.crypto === 'undefined') {
   global.crypto = require('crypto').webcrypto;
 }
 
-const path = require('path');
-require("dotenv").config({ path: path.join(__dirname, '.env') });
+require("dotenv").config();
 
 const nodeEnv = (process.env.NODE_ENV || '').toLowerCase();
 const isNeonMode = nodeEnv === 'neon' || process.env.NEON_CLOUD_MODE === 'true';
@@ -51,6 +43,7 @@ const { initializeDatabase, ensureNeonShelfSchemaCompatibility, createUsersTable
 const createRecommendationsRoutes = require('./routes/recommendations');
 const booksRoutes = require('./routes/booksRoutes');
 const booksAdminRoutes = require('./routes/booksAdminRoutes');
+const adminRoutes = require('./routes/adminRoutes');
 const readingSessionRoutes = require('./routes/readingSessionRoutes');
 const analyticsRoutes = require('./routes/analyticsRoutes');
 const userRoutes = require('./routes/userRoutes');
@@ -63,8 +56,6 @@ require('./jobs/cron'); //init cron jobs for ai-related tasks
 // INITIALIZE
 // ==========================================
 const app = express();
-const fsDebug = require('fs');
-fsDebug.appendFileSync('./debug-requests.log', `[${new Date().toISOString()}] app = express() created\n`);
 
 // CORS setup
 app.use((req, res, next) => {
@@ -94,21 +85,6 @@ app.use(cors({
   credentials: true,
 }));
 
-// ✅ Serve static files from uploads folder (for PDF downloads)
-app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
-  setHeaders: (res, filePath) => {
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', 'inline'); // Show in browser, not download
-  }
-}));
-console.log(`✅ Static uploads folder mounted at /uploads`);
-
-// DEBUG: Log all requests
-app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] 📍 ${req.method} ${req.path}`);
-  next();
-});
-
 // Setup Auth
 const authProvider = new FirebaseProvider();
 const authService = new AuthService(authProvider);
@@ -121,23 +97,7 @@ const optionalVerifyTokenMiddleware = createOptionalVerifyTokenMiddleware(authSe
 
 // Health Check
 app.get("/", (req, res) => {
-  require('fs').appendFileSync('./debug-requests.log', `[${new Date().toISOString()}] GET / hit\n`);
   res.json({ message: "Pustara API ready", status: "healthy" });
-});
-
-// TEST GET - verify app.get works
-app.get("/test-get", (req, res) => {
-  const fs = require('fs');
-  fs.appendFileSync('./debug-requests.log', `[${new Date().toISOString()}] GET /test-get hit\n`);
-  console.log('✅ GET /test-get reached!');
-  res.json({ success: true, msg: "GET works" });
-});
-require('fs').appendFileSync('./debug-requests.log', `[${new Date().toISOString()}] app.get("/test-get") REGISTERED\n`);
-
-// TEST - Different path
-app.post("/test-endpoint", (req, res) => {
-  console.log('🎯 POST /test-endpoint reached!');
-  res.json({ success: true, msg: "test-endpoint works" });
 });
 
 // Auth Routes
@@ -151,19 +111,24 @@ app.get("/api/protected", verifyTokenMiddleware, (req, res) => {
   res.json({ message: "Protected data", user: req.user });
 });
 
-// PROTECTED: Reviews endpoint (requires Firebase auth)
-const booksController = require('./controllers/booksController');
-app.post('/reviews', verifyTokenMiddleware, booksController.createOrUpdateReview);
-
 // Recommendations Routes
 app.use('/recommendations', createRecommendationsRoutes(verifyTokenMiddleware, optionalVerifyTokenMiddleware));
 
-// Books Routes (dengan Azure Blob file handling)
-app.use('/', booksRoutes);
-
 // Books Admin Routes (protected by verifyToken + authorizeAdmin)
 // IMPORTANT: Mount to /admin prefix to avoid catching all / routes
+// app.use('/', verifyTokenMiddleware, authorizeAdmin, booksAdminRoutes);
+
 app.use('/admin/books', verifyTokenMiddleware, authorizeAdmin, booksAdminRoutes);
+
+// Books Routes (public catalog + token-aware protected reader endpoints)
+app.use('/', optionalVerifyTokenMiddleware, booksRoutes);
+
+app.use('/admin', verifyTokenMiddleware, authorizeAdmin, adminRoutes);
+
+// User Management Admin Routes (protected by verifyToken + authorizeAdmin)
+// NOTE: Do not mount adminRoutes at root ('/'), it can hijack '/users/*' endpoints
+// such as '/users/username-availability' and incorrectly require admin auth.
+// Keep admin routes under '/admin' only.
 
 // Reading Session Routes (track user reading progress)
 app.use('/reading', verifyTokenMiddleware, readingSessionRoutes);
@@ -199,9 +164,6 @@ async function startServer() {
   
   try {
     console.log("\n⏳ Initializing Database...");
-    console.log(`   NODE_ENV: ${process.env.NODE_ENV}`);
-    console.log(`   DATABASE_URL set: ${!!process.env.DATABASE_URL}`);
-    
     await initializeDatabase();
     try {
       await ensureNeonShelfSchemaCompatibility();
@@ -214,10 +176,9 @@ async function startServer() {
     const surveyTableReady = await createUserSurveyTable();
     dbConnected = true;
   } catch (dbError) {
-    console.error("\n❌ Database initialization FAILED:");
-    console.error(`   Error: ${dbError.message}`);
-    console.error(`   Stack: ${dbError.stack}`);
-    console.error("   ⚠️  API endpoints that need database will return 500 errors\n");
+    console.warn("\n⚠️  Database initialization failed (running in offline mode):");
+    console.warn(`   ${dbError.message}`);
+    console.warn("   You can still use the API with limited functionality\n");
   }
   
   // Start server even if DB failed

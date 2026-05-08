@@ -83,20 +83,13 @@ async function ensureNeonShelfSchemaCompatibility() {
   if (!pgPool) throw new Error('Neon DB not initialized. Call initializeDatabase() first');
 
   const safeStatements = [
-    "ALTER TABLE IF EXISTS books ADD COLUMN IF NOT EXISTS total_stock INTEGER DEFAULT 5",
-    "ALTER TABLE IF EXISTS books ADD COLUMN IF NOT EXISTS available INTEGER DEFAULT 5",
-    "ALTER TABLE IF EXISTS books ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true",
-    "ALTER TABLE IF EXISTS books ADD COLUMN IF NOT EXISTS cover_url TEXT",
     "ALTER TABLE IF EXISTS wishlist ADD COLUMN IF NOT EXISTS added_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP",
     "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS borrowed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP",
+    "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS due_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP + INTERVAL '7 days'",
     "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS due_date TIMESTAMPTZ",
-    "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS due_at TIMESTAMPTZ",
     "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS returned_at TIMESTAMPTZ",
     "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS extended BOOLEAN DEFAULT false",
     "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
-    "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS user_id UUID",
-    "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS book_id UUID",
-    "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS reading_time_minutes INTEGER DEFAULT 0",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS status TEXT",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ",
@@ -104,6 +97,7 @@ async function ensureNeonShelfSchemaCompatibility() {
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS progress_percentage NUMERIC DEFAULT 0",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS current_page INTEGER DEFAULT 0",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS total_pages INTEGER DEFAULT 0",
+    "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS reading_time_minutes INTEGER DEFAULT 0",
   ];
 
   for (const statement of safeStatements) {
@@ -141,6 +135,17 @@ async function ensureNeonShelfSchemaCompatibility() {
      BEGIN
        IF EXISTS (
          SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'loans' AND column_name = 'due_date'
+       ) THEN
+         UPDATE loans
+         SET due_at = COALESCE(due_at, due_date)
+         WHERE due_at IS NULL;
+       END IF;
+     END $$;`,
+    `DO $$
+     BEGIN
+       IF EXISTS (
+         SELECT 1 FROM information_schema.columns
          WHERE table_schema = 'public' AND table_name = 'loans' AND column_name = 'created_at'
        ) THEN
          UPDATE loans
@@ -148,8 +153,40 @@ async function ensureNeonShelfSchemaCompatibility() {
          WHERE borrowed_at IS NULL;
        END IF;
      END $$;`,
+    `DO $$
+     BEGIN
+       IF EXISTS (
+         SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'reading_sessions' AND column_name = 'start_time'
+       ) THEN
+         UPDATE reading_sessions
+         SET started_at = COALESCE(started_at, start_time)
+         WHERE started_at IS NULL;
+       END IF;
+     END $$;`,
+    `DO $$
+     BEGIN
+       IF EXISTS (
+         SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'reading_sessions' AND column_name = 'pages_read'
+       ) THEN
+         UPDATE reading_sessions
+         SET current_page = COALESCE(current_page, pages_read)
+         WHERE current_page IS NULL OR current_page = 0;
+       END IF;
+     END $$;`,
+    `DO $$
+     BEGIN
+       IF EXISTS (
+         SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'reading_sessions' AND column_name = 'duration_minutes'
+       ) THEN
+         UPDATE reading_sessions
+         SET reading_time_minutes = COALESCE(reading_time_minutes, duration_minutes)
+         WHERE reading_time_minutes IS NULL OR reading_time_minutes = 0;
+       END IF;
+     END $$;`,
     `UPDATE reading_sessions SET status = COALESCE(status, 'reading') WHERE status IS NULL`,
-    `UPDATE reading_sessions SET reading_time_minutes = COALESCE(reading_time_minutes, 0) WHERE reading_time_minutes IS NULL`,
   ];
 
   for (const statement of backfillBlocks) {
@@ -173,8 +210,7 @@ async function executeQuery(query, params = []) {
   if (isNeon) {
     if (!pgPool) throw new Error('Neon DB not initialized. Call initializeDatabase() first');
     const result = await pgPool.query(query, params);
-    // Return in same format as Azure for compatibility
-    return { rows: result.rows };
+    return result.rows;
   }
 
   // Azure SQL logic
@@ -221,11 +257,11 @@ async function executeQuery(query, params = []) {
   // 4. Convert ILIKE to LIKE for case-insensitive search
   azureQuery = azureQuery.replace(/\bILIKE\b/gi, 'LIKE');
   
-  const azureResult = await request.query(azureQuery);
+  const result = await request.query(azureQuery);
   
   // Return in same format as pg library for compatibility
   // Controllers expect result.rows, but mssql uses result.recordset
-  return { rows: azureResult.recordset };
+  return { rows: result.recordset };
 }
 
 /**
@@ -259,12 +295,23 @@ async function createUsersTable() {
           email NVARCHAR(255) UNIQUE NOT NULL,
           displayName NVARCHAR(255),
           photoURL NVARCHAR(MAX),
+          role NVARCHAR(50) DEFAULT 'reader',
           createdAt DATETIME DEFAULT GETDATE(),
           updatedAt DATETIME DEFAULT GETDATE()
         );
         CREATE INDEX idx_email ON Users(email);
         CREATE INDEX idx_uid ON Users(uid);
+        CREATE INDEX idx_role ON Users(role);
         PRINT 'Users table created';
+      END
+      ELSE
+      BEGIN
+        IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'Users' AND COLUMN_NAME = 'role')
+        BEGIN
+          ALTER TABLE Users ADD role NVARCHAR(50) DEFAULT 'reader';
+          CREATE INDEX idx_role ON Users(role);
+          PRINT 'Added role column to Users table';
+        END
       END
     `);
     console.log('✅ Users table ready');

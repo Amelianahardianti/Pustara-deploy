@@ -22,7 +22,6 @@
   "dependencies": {
     "@azure/storage-blob": "^12.31.0",
     "@upstash/redis": "^1.37.0",
-    "axios": "^1.13.6",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
@@ -35,6 +34,7 @@
     "redis": "^5.11.0"
   },
   "devDependencies": {
+    "@types/canvas-confetti": "^1.9.0",
     "husky": "^8.0.3",
     "nodemon": "^3.1.14"
   }
