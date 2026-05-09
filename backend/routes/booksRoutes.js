@@ -11,6 +11,8 @@ router.get('/books/:id/similar', booksController.getSimilarBooks);
 router.get('/books/:id', booksController.getBookDetail);
 router.get('/books/:id/access', booksController.getBookReadAccess);
 router.get('/books/:id/file', booksController.downloadBookFile);
+router.get('/books/:id/reviews', booksController.getBookReviews);
+router.post('/reviews', booksController.createOrUpdateReview);
 
 // Admin routes will be mounted separately with auth middleware in index.js
 // router.post('/books', authorizeAdmin, booksController.createBook);

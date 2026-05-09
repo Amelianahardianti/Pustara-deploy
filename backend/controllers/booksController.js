@@ -133,6 +133,217 @@ async function resolveActiveLoanAccess(firebaseUid, bookId) {
   };
 }
 
+// GET /books/:id/reviews - Get book reviews
+exports.getBookReviews = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { limit = 100, offset = 0 } = req.query;
+    const limitNum = sanitizePagination(limit, 100, 1, 500);
+    const offsetNum = sanitizePagination(offset, 0, 0, 100000);
+
+    if (!isUuidLike(id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid book id format',
+        error: { code: 'INVALID_BOOK_ID', id },
+      });
+    }
+
+    // Verify book exists
+    const bookCheck = await db.executeQuery(
+      'SELECT id FROM books WHERE id = $1 AND is_active = true',
+      [id]
+    );
+
+    const bookRows = toRows(bookCheck);
+
+    if (bookRows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Book not found',
+        error: { code: 'BOOK_NOT_FOUND', id },
+      });
+    }
+
+    // Fetch reviews with user info
+    const query = `
+      SELECT 
+        r.id,
+        r.rating,
+        r.body as text,
+        r.created_at as time,
+        u.display_name as name,
+        COALESCE(u.display_name, 'U') as avatar
+      FROM reviews r
+      JOIN users u ON r.user_id = u.id
+      WHERE r.book_id = $1
+      ORDER BY r.created_at DESC
+      LIMIT $2 OFFSET $3
+    `;
+
+    const result = await db.executeQuery(query, [id, limitNum, offsetNum]);
+    const reviews = toRows(result);
+
+    // Get total count
+    const countResult = await db.executeQuery(
+      'SELECT COUNT(*) as total FROM reviews WHERE book_id = $1',
+      [id]
+    );
+
+    const countRows = toRows(countResult);
+
+    const totalReviews =
+      Number.parseInt(String(countRows[0]?.total || 0), 10) || 0;
+
+    res.json({
+      success: true,
+      data: reviews,
+      pagination: {
+        limit: limitNum,
+        offset: offsetNum,
+        total: totalReviews,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching book reviews:', error.message);
+
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+// POST /reviews - Create or update a review
+exports.createOrUpdateReview = async (req, res) => {
+  try {
+    const { book_id, rating, body } = req.body;
+    const firebase_uid = req.user?.uid;
+    
+    if (!firebase_uid) {
+    return res.status(401).json({
+      success: false,
+      message: 'User not authenticated',
+      });
+    }
+
+    const userResult = await db.executeQuery(
+      'SELECT id FROM users WHERE firebase_uid = $1',
+      [firebase_uid]
+    );
+
+    const userRows = toRows(userResult);
+
+    if (userRows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found',
+      });
+    }
+
+    const user_id = userRows[0].id;
+
+    // Validation
+    if (!book_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'book_id is required',
+      });
+    }
+
+    if (!rating || rating < 1 || rating > 5) {
+      return res.status(400).json({
+        success: false,
+        message: 'rating must be 1-5',
+      });
+    }
+
+    if (!body || typeof body !== 'string' || body.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'body is required',
+      });
+    }
+
+    if (!user_id) {
+      return res.status(401).json({
+        success: false,
+        message: 'User not authenticated',
+      });
+    }
+
+    // Check if review exists
+    const checkQuery =
+      'SELECT id FROM reviews WHERE book_id = $1 AND user_id = $2';
+
+    const checkResult = await db.executeQuery(checkQuery, [
+      book_id,
+      user_id,
+    ]);
+
+    const existingRows = toRows(checkResult);
+
+    let query;
+    let values;
+    let reviewId;
+
+    if (existingRows.length > 0) {
+      // UPDATE existing review
+      reviewId = existingRows[0].id;
+
+      query = `
+        UPDATE reviews
+        SET rating = $1, body = $2, updated_at = NOW()
+        WHERE id = $3 AND user_id = $4
+        RETURNING id, rating, body, created_at, updated_at
+      `;
+
+      values = [rating, body, reviewId, user_id];
+    } else {
+      // INSERT new review
+      query = `
+        INSERT INTO reviews (user_id, book_id, rating, body)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, rating, body, created_at, updated_at
+      `;
+
+      values = [user_id, book_id, rating, body];
+    }
+
+    const result = await db.executeQuery(query, values);
+    const rows = toRows(result);
+
+    if (rows.length === 0) {
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to save review',
+      });
+    }
+
+    const review = rows[0];
+
+    res.json({
+      success: true,
+      data: {
+        id: review.id,
+        book_id,
+        user_id,
+        rating: review.rating,
+        body: review.body,
+        created_at: review.created_at,
+        updated_at: review.updated_at,
+      },
+    });
+  } catch (error) {
+    console.error('Error creating/updating review:', error.message);
+
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
 // GET /books - List all books dengan pagination & filters
 exports.getBooks = async (req, res) => {
   try {
