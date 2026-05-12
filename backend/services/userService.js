@@ -54,7 +54,8 @@ class UserService {
    */
   static async getUserByUid(uid) {
     try {
-      const col  = isNeon ? 'firebase_uid' : 'uid';
+      // Use `firebase_uid` column for both Neon and Azure schema to avoid mismatches
+      const col  = 'firebase_uid';
       const rows = await executeQuery(`SELECT * FROM ${isNeon ? 'users' : 'Users'} WHERE ${col} = $1`, [uid]);
       return { success: true, data: rows[0] || null };
     } catch (error) {
@@ -115,7 +116,7 @@ class UserService {
    */
   static async getUserRole(uid) {
     try {
-      const col = isNeon ? 'firebase_uid' : 'uid';
+      const col = 'firebase_uid';
       const rows = await executeQuery(`SELECT role FROM ${isNeon ? 'users' : 'Users'} WHERE ${col} = $1`, [uid]);
       return { success: true, role: rows[0]?.role || 'reader' };
     } catch (error) {

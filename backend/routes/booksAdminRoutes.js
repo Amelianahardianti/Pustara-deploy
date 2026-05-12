@@ -10,8 +10,11 @@ const booksController = require('../controllers/booksController');
 // router.put('/books/:id', booksController.updateBook);
 // router.delete('/books/:id', booksController.deleteBook);
 
-router.put('/:id', booksController.updateBook);
+// routes/booksAdminRoutes.js
+
 router.post('/', booksController.createBook);
 router.get('/without-file', booksController.getBooksWithoutFile);
+router.put('/top-picks', booksController.setTopPicks);
+router.put('/:id', booksController.updateBook);
 
 module.exports = router;

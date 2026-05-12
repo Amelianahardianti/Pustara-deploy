@@ -970,3 +970,80 @@ exports.getBooksWithoutFile = async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 };
+
+// GET /books/top-picks [public]: ambil daftar Pustakrew's Pick
+exports.getTopPicks = async (req, res) => {
+  try {
+    // auto-create tabel if not exists (safe to re-run)
+    await db.executeQuery(`
+      CREATE TABLE IF NOT EXISTS librarian_picks (
+        id          SERIAL PRIMARY KEY,
+        book_id     UUID NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        sort_order  INT  NOT NULL DEFAULT 0,
+        created_at  TIMESTAMPTZ DEFAULT now(),
+        updated_at  TIMESTAMPTZ DEFAULT now()
+      )
+    `, []);
+
+    const result = await db.executeQuery(`
+      SELECT
+        b.id, b.title, b.authors, b.genres, b.cover_url,
+        b.avg_rating, b.rating_count, b.year, b.pages,
+        b.available, b.total_stock, b.description,
+        lp.sort_order
+      FROM librarian_picks lp
+      JOIN books b ON b.id = lp.book_id AND b.is_active = true
+      ORDER BY lp.sort_order ASC
+    `, []);
+
+    const rows = toRows(result);
+    res.json({ success: true, data: rows });
+  } catch (error) {
+    console.error('Error fetching top picks:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// PUT /admin/books/top-picks [admin]: update daftar Pustakrew's Pick
+// Body: { book_ids: ["uuid1", "uuid2", "uuid3"] }
+exports.setTopPicks = async (req, res) => {
+  try {
+    const { book_ids } = req.body;
+
+    if (!Array.isArray(book_ids) || book_ids.length === 0) {
+      return res.status(400).json({ success: false, message: 'book_ids harus array dan tidak boleh kosong' });
+    }
+    if (book_ids.length > 3) {
+      return res.status(400).json({ success: false, message: 'Maksimal 3 buku untuk Pustakrew\'s Pick' });
+    }
+
+    // Hapus semua picks lama, lalu insert yang baru
+    await db.executeQuery('DELETE FROM librarian_picks', []);
+
+    for (let i = 0; i < book_ids.length; i++) {
+      await db.executeQuery(
+        'INSERT INTO librarian_picks (book_id, sort_order) VALUES ($1, $2)',
+        [book_ids[i], i + 1]
+      );
+    }
+
+    // Return picks terbaru
+    const result = await db.executeQuery(`
+      SELECT
+        b.id, b.title, b.authors, b.genres, b.cover_url,
+        b.avg_rating, b.year, lp.sort_order
+      FROM librarian_picks lp
+      JOIN books b ON b.id = lp.book_id AND b.is_active = true
+      ORDER BY lp.sort_order ASC
+    `, []);
+
+    res.json({
+      success: true,
+      message: 'Pustakrew\'s Pick berhasil diperbarui',
+      data: toRows(result),
+    });
+  } catch (error) {
+    console.error('Error setting top picks:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};

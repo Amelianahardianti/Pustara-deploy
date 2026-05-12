@@ -206,6 +206,48 @@ async function resolveActorUserId(req) {
   return String(actor.data.id);
 }
 
+/**
+ * Resolve a username or numeric ID to a user ID (numeric ID)
+ * @param {string} usernameOrId - Username or numeric ID
+ * @returns {Promise<string|null>} - User ID or null if not found
+ */
+async function resolveUsernameOrIdToUserId(usernameOrId) {
+  if (!usernameOrId) return null;
+
+  const normalized = String(usernameOrId).trim();
+  const decoded = (() => {
+    try {
+      return decodeURIComponent(normalized);
+    } catch (_) {
+      return normalized;
+    }
+  })();
+  const candidate = decoded.startsWith('@') ? decoded.slice(1) : decoded;
+
+  // If it's a numeric ID, try that first
+  if (/^\d+$/.test(candidate)) {
+    return candidate;
+  }
+
+  // Otherwise, treat it as a username and query
+  try {
+    const rows = toRows(
+      await db.executeQuery(
+        'SELECT id FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1',
+        [candidate]
+      )
+    );
+
+    if (rows.length > 0) {
+      return String(rows[0].id);
+    }
+  } catch (err) {
+    console.error('Error resolving username:', err.message);
+  }
+
+  return null;
+}
+
 async function countFollowers(userId) {
   const rows = toRows(
     await db.executeQuery('SELECT COUNT(*) AS total FROM follows WHERE following_id = $1', [userId])
@@ -379,9 +421,22 @@ async function buildUserProfile(targetUserId, actorId = null) {
 exports.getUserProfile = async (req, res) => {
   try {
     const { id } = req.params;
+    console.log(`[getUserProfile] Incoming request for: ${id}`);
     const actorId = await resolveActorUserId(req);
 
-    const profile = await buildUserProfile(id, actorId);
+    // Resolve username or ID to actual user ID
+    const targetUserId = await resolveUsernameOrIdToUserId(id);
+    console.log(`[getUserProfile] Resolved ID: ${targetUserId}`);
+    
+    if (!targetUserId) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found',
+        error: { code: 'USER_NOT_FOUND', id },
+      });
+    }
+
+    const profile = await buildUserProfile(targetUserId, actorId);
     if (!profile) {
       return res.status(404).json({
         success: false,
@@ -561,13 +616,22 @@ exports.updateMyProfile = async (req, res) => {
 
 exports.followUser = async (req, res) => {
   try {
-    const targetUserId = String(req.params.id);
+    const { id } = req.params;
     const actorUserId = await resolveActorUserId(req);
 
     if (!actorUserId) {
       return res.status(401).json({
         success: false,
         message: 'Authentication required to follow user',
+      });
+    }
+
+    // Resolve username or ID to actual user ID
+    const targetUserId = await resolveUsernameOrIdToUserId(id);
+    if (!targetUserId) {
+      return res.status(404).json({
+        success: false,
+        message: 'Target user not found',
       });
     }
 
@@ -626,13 +690,22 @@ exports.followUser = async (req, res) => {
 
 exports.unfollowUser = async (req, res) => {
   try {
-    const targetUserId = String(req.params.id);
+    const { id } = req.params;
     const actorUserId = await resolveActorUserId(req);
 
     if (!actorUserId) {
       return res.status(401).json({
         success: false,
         message: 'Authentication required to unfollow user',
+      });
+    }
+
+    // Resolve username or ID to actual user ID
+    const targetUserId = await resolveUsernameOrIdToUserId(id);
+    if (!targetUserId) {
+      return res.status(404).json({
+        success: false,
+        message: 'Target user not found',
       });
     }
 

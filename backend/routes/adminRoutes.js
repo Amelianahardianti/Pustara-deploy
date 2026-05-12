@@ -12,6 +12,10 @@
 const express = require('express');
 const router = express.Router();
 const UserService = require('../services/userService');
+const { getAdminDashboardAnalytics } = require('../services/analyticsService');
+const DASHBOARD_OVERVIEW_TTL_MS = 30 * 1000;
+
+let dashboardOverviewCache = null;
 
 const asyncHandler = (fn) => (req, res, next) => {
   Promise.resolve(fn(req, res, next)).catch((err) => {
@@ -114,6 +118,32 @@ router.delete('/users/:uid', asyncHandler(async (req, res) => {
   res.json({
     success: true,
     message: 'User deletion not yet implemented',
+  });
+}));
+
+/**
+ * GET /admin/dashboard/overview - Aggregated dashboard analytics for admin FE
+ */
+router.get('/dashboard/overview', asyncHandler(async (_req, res) => {
+  const now = Date.now();
+  if (dashboardOverviewCache && dashboardOverviewCache.expiresAt > now) {
+    return res.json({
+      success: true,
+      data: dashboardOverviewCache.data,
+      cached: true,
+    });
+  }
+
+  const data = await getAdminDashboardAnalytics();
+  dashboardOverviewCache = {
+    data,
+    expiresAt: now + DASHBOARD_OVERVIEW_TTL_MS,
+  };
+
+  res.json({
+    success: true,
+    data,
+    cached: false,
   });
 }));
 

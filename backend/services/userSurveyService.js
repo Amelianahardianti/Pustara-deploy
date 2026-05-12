@@ -51,6 +51,31 @@ function normalizeSurveyRecord(row) {
   };
 }
 
+function parseFavoriteGenreList(value) {
+  const text = toNull(value);
+  if (!text || text === SKIPPED_SENTINEL) return [];
+  return text
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+async function syncUserPreferredGenres(userId, favoriteGenre) {
+  const preferredGenres = parseFavoriteGenreList(favoriteGenre);
+  const userTable = isNeon ? 'users' : 'Users';
+  // If no genres selected, store NULL to clear the field
+  const hasAny = Array.isArray(preferredGenres) && preferredGenres.length > 0;
+
+  // For Neon/Postgres, pass a real JS array so node-postgres will bind it to a Postgres array type (text[]).
+  // For Azure SQL, keep JSON string because Azure schema stores JSON in an NVARCHAR field.
+  const valueToSet = hasAny ? (isNeon ? preferredGenres : JSON.stringify(preferredGenres)) : null;
+
+  await executeQuery(
+    `UPDATE ${userTable} SET preferred_genres = $2 WHERE id = $1`,
+    [userId, valueToSet]
+  );
+}
+
 async function upsertSurvey(userId, gender, age, favoriteGenre) {
   let query = '';
 
@@ -102,6 +127,8 @@ class UserSurveyService {
         normalizeFavoriteGenre(favoriteGenre)
       );
 
+      await syncUserPreferredGenres(userId, saved?.favoriteGenre ?? favoriteGenre ?? null);
+
       const normalized = normalizeSurveyRecord(saved);
 
       return {
@@ -145,30 +172,20 @@ class UserSurveyService {
         return { success: false, error: 'No valid fields to update' };
       }
 
-      const setClause = fields.map((f, i) => `${f} = $${i + 2}`).join(', ');
-      const values = [userId, ...fields.map(f => updates[f])];
-      const timeFunc = isNeon ? 'NOW()' : 'GETDATE()';
-      
-      let query = '';
+      const existingRows = await executeQuery('SELECT * FROM UserSurvey WHERE userId = $1', [userId]);
+      const existing = existingRows[0] || null;
 
-      if (isNeon) {
-        query = `
-          UPDATE UserSurvey
-          SET ${setClause}, updatedAt = ${timeFunc}
-          WHERE userId = $1
-          RETURNING *
-        `;
-      } else {
-        query = `
-          UPDATE UserSurvey
-          SET ${setClause}, updatedAt = ${timeFunc}
-          WHERE userId = $1;
-          SELECT * FROM UserSurvey WHERE userId = $1;
-        `;
-      }
+      const saved = await upsertSurvey(
+        userId,
+        fields.includes('gender') ? toNull(updates.gender) : toNull(existing?.gender),
+        fields.includes('age') ? toNull(updates.age) : toNull(existing?.age),
+        fields.includes('favoriteGenre')
+          ? normalizeFavoriteGenre(updates.favoriteGenre)
+          : normalizeFavoriteGenre(existing?.favoriteGenre)
+      );
 
-      const rows = await executeQuery(query, values);
-      return { success: true, data: normalizeSurveyRecord(rows[0]) };
+      await syncUserPreferredGenres(userId, saved?.favoriteGenre ?? null);
+      return { success: true, data: normalizeSurveyRecord(saved) };
     } catch (error) {
       console.error('Error updating survey:', error);
       return { success: false, error: error.message };
@@ -183,6 +200,7 @@ class UserSurveyService {
       }
 
       const saved = await upsertSurvey(userResult.data.id, null, null, SKIPPED_SENTINEL);
+      await syncUserPreferredGenres(userResult.data.id, null);
       const normalized = normalizeSurveyRecord(saved);
 
       return {
@@ -200,12 +218,34 @@ class UserSurveyService {
     try {
       const surveyResult = await this.getSurveyByUid(uid);
       if (!surveyResult.success) {
-        return { success: true, data: { has_survey: false, survey_status: 'not_started' } };
+        return {
+          success: true,
+          data: {
+            has_survey: false,
+            survey_status: 'not_started',
+            should_prompt_personalization: false,
+          },
+        };
       }
 
       const data = surveyResult.data;
       if (!data) {
-        return { success: true, data: { has_survey: false, survey_status: 'not_started' } };
+        const userResult = await UserService.getUserByUid(uid);
+        const createdAtRaw = userResult?.data?.created_at ?? userResult?.data?.createdAt ?? null;
+        const createdAt = createdAtRaw ? new Date(createdAtRaw) : null;
+        const isFreshSignup =
+          createdAt instanceof Date &&
+          !Number.isNaN(createdAt.getTime()) &&
+          Date.now() - createdAt.getTime() <= 60 * 60 * 1000;
+
+        return {
+          success: true,
+          data: {
+            has_survey: false,
+            survey_status: 'not_started',
+            should_prompt_personalization: Boolean(isFreshSignup),
+          },
+        };
       }
 
       return {
@@ -214,6 +254,7 @@ class UserSurveyService {
           has_survey: Boolean(data.has_survey),
           survey_status: data.survey_status,
           skipped: Boolean(data.skipped),
+          should_prompt_personalization: data.survey_status === 'not_started',
         },
       };
     } catch (error) {

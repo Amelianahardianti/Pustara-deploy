@@ -7,11 +7,13 @@ const booksController = require('../controllers/booksController');
 router.get('/books', booksController.getBooks);
 router.get('/books/genres', booksController.getGenres);
 router.get('/books/search', booksController.searchBooks);
+router.get('/books/top-picks', booksController.getTopPicks);
 router.get('/books/:id/similar', booksController.getSimilarBooks);
 router.get('/books/:id', booksController.getBookDetail);
 router.get('/books/:id/access', booksController.getBookReadAccess);
 router.get('/books/:id/file', booksController.downloadBookFile);
 router.get('/books/:id/reviews', booksController.getBookReviews);
+router.get('/books/top-picks', booksController.getTopPicks);
 router.post('/reviews', booksController.createOrUpdateReview);
 
 // Admin routes will be mounted separately with auth middleware in index.js

@@ -157,9 +157,171 @@ async function getTopBooks(limit = 10) {
   }
 }
 
+function toNumber(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function formatDisplayDate(input) {
+  if (!input) return null;
+  const date = new Date(input);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString();
+}
+
+/**
+ * Get admin dashboard analytics data.
+ * Designed for FE dashboard-all-things page.
+ */
+async function getAdminDashboardAnalytics() {
+  const pool = getPool();
+
+  const [
+    totalsResult,
+    topBooksResult,
+    categoryResult,
+    growthResult,
+    activityResult,
+  ] = await Promise.all([
+    pool.query(`
+      SELECT
+        (SELECT COUNT(*) FROM books WHERE is_active = true) AS total_books,
+        (SELECT COUNT(*) FROM users) AS total_users,
+        (SELECT COUNT(*) FROM loans WHERE status IN ('active', 'extended')) AS active_loans,
+        (SELECT COUNT(*) FROM users
+          WHERE COALESCE(created_at, now()) >= now() - interval '7 days') AS new_users_7d
+    `),
+    pool.query(`
+      SELECT
+        b.id,
+        b.title,
+        COALESCE((b.genres)[1], 'Lainnya') AS primary_genre,
+        COUNT(l.id) AS total
+      FROM books b
+      LEFT JOIN loans l ON l.book_id = b.id
+      WHERE b.is_active = true
+      GROUP BY b.id, b.title, primary_genre
+      ORDER BY total DESC, b.title ASC
+      LIMIT 10
+    `),
+    pool.query(`
+      SELECT
+        genre,
+        COUNT(*)::int AS value
+      FROM (
+        SELECT unnest(COALESCE(genres, ARRAY['Lainnya'])) AS genre
+        FROM books
+        WHERE is_active = true
+      ) genre_rows
+      GROUP BY genre
+      ORDER BY value DESC
+      LIMIT 6
+    `),
+    pool.query(`
+      SELECT
+        to_char(d.day, 'MM-DD') AS day,
+        (
+          SELECT COUNT(*)
+          FROM users u
+          WHERE date(COALESCE(u.created_at, now())) <= d.day
+        )::int AS users,
+        (
+          SELECT COUNT(*)
+          FROM users u2
+          WHERE date(COALESCE(u2.created_at, now())) = d.day
+        )::int AS new_users
+      FROM (
+        SELECT generate_series(current_date - interval '5 days', current_date, interval '1 day')::date AS day
+      ) d
+      ORDER BY d.day ASC
+    `),
+    pool.query(`
+      SELECT * FROM (
+        SELECT
+          'Admin Pustara'::text AS actor,
+          'Menambahkan buku ' || COALESCE(title, 'Tanpa Judul') AS action,
+          'Buku baru masuk katalog'::text AS detail,
+          created_at AS event_time
+        FROM books
+        WHERE created_at IS NOT NULL
+
+        UNION ALL
+
+        SELECT
+          'Admin Pustara'::text AS actor,
+          'Memperbarui buku ' || COALESCE(title, 'Tanpa Judul') AS action,
+          'Metadata buku diperbarui'::text AS detail,
+          updated_at AS event_time
+        FROM books
+        WHERE updated_at IS NOT NULL
+
+        UNION ALL
+
+        SELECT
+          COALESCE(u.display_name, u.username, split_part(u.email, '@', 1), 'Pengguna') AS actor,
+          'Meminjam buku ' || COALESCE(b.title, 'Tanpa Judul') AS action,
+          'Status peminjaman aktif'::text AS detail,
+          l.borrowed_at AS event_time
+        FROM loans l
+        JOIN users u ON u.id = l.user_id
+        JOIN books b ON b.id = l.book_id
+        WHERE l.borrowed_at IS NOT NULL
+
+        UNION ALL
+
+        SELECT
+          COALESCE(u.display_name, u.username, split_part(u.email, '@', 1), 'Pengguna') AS actor,
+          'Mengembalikan buku ' || COALESCE(b.title, 'Tanpa Judul') AS action,
+          'Buku dikembalikan ke pustaka'::text AS detail,
+          l.returned_at AS event_time
+        FROM loans l
+        JOIN users u ON u.id = l.user_id
+        JOIN books b ON b.id = l.book_id
+        WHERE l.returned_at IS NOT NULL
+      ) x
+      WHERE event_time IS NOT NULL
+      ORDER BY event_time DESC
+      LIMIT 8
+    `),
+  ]);
+
+  const totals = totalsResult.rows[0] || {};
+
+  return {
+    metrics: {
+      total_books: toNumber(totals.total_books),
+      active_users: toNumber(totals.total_users),
+      active_loans: toNumber(totals.active_loans),
+      new_users_7d: toNumber(totals.new_users_7d),
+    },
+    top_books: topBooksResult.rows.map((row) => ({
+      id: row.id,
+      title: row.title,
+      total: toNumber(row.total),
+      primary_genre: row.primary_genre || 'Lainnya',
+    })),
+    category_distribution: categoryResult.rows.map((row) => ({
+      label: row.genre || 'Lainnya',
+      value: toNumber(row.value),
+    })),
+    daily_growth: growthResult.rows.map((row) => ({
+      day: row.day,
+      users: toNumber(row.users),
+      newUsers: toNumber(row.new_users),
+    })),
+    recent_activity: activityResult.rows.map((row) => ({
+      actor: row.actor,
+      action: row.action,
+      detail: row.detail,
+      time: formatDisplayDate(row.event_time),
+    })),
+  };
+}
+
 module.exports = {
   getActiveUsers,
   getReadingTimeStats,
   getUserReadingHistory,
   getTopBooks,
+  getAdminDashboardAnalytics,
 };
