@@ -7,6 +7,9 @@ const express = require('express');
 const { pushActivity, getUserRecentBooks } = require('../services/redis');
 const UserSurveyService = require('../services/userSurveyService');
 
+const TRENDING_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const TRENDING_RESPONSE_CACHE = new Map();
+
 const getAiUrl = () => process.env.FASTAPI_URL || 'http://localhost:8001';
 
 function toFiniteNumber(value, fallback = 0) {
@@ -397,16 +400,18 @@ function createRecommendationsRoutes(verifyTokenMiddleware, optionalVerifyTokenM
     optionalVerifyTokenMiddleware,
     asyncHandler(async (req, res) => {
       const { top_n = 10 } = req.query;
-      const uid = req.user?.uid;
-      const surveyCtx = uid ? await getUserSurveyContext(uid) : {};
+      const cacheKey = `trending:${top_n}`;
+      const cached = TRENDING_RESPONSE_CACHE.get(cacheKey);
+      if (cached && (Date.now() - cached.at) < TRENDING_CACHE_TTL_MS) {
+        res.json({ success: true, data: cached.data });
+        return;
+      }
 
       const params = new URLSearchParams({ n: top_n, top_n: top_n });
-      
-      if (surveyCtx.user_gender) params.set('gender', surveyCtx.user_gender);
-      if (surveyCtx.user_age_group) params.set('age_group', surveyCtx.user_age_group);
-
-      const result = await proxyToAI('GET', `/recommendations/trending?${params.toString()}`);
-      res.json({ success: true, data: normalizeTrendingPayload(result) });
+      const result = await proxyToAI('GET', `/recommendations/trending?${params}`);
+      const data = normalizeTrendingPayload(result);
+      TRENDING_RESPONSE_CACHE.set(cacheKey, { at: Date.now(), data });
+      res.json({ success: true, data });
     })
   );
 
@@ -420,6 +425,37 @@ function createRecommendationsRoutes(verifyTokenMiddleware, optionalVerifyTokenM
       } catch (err) {
         res.status(503).json({ success: false, ai_service: 'down', error: err.message });
       }
+    })
+  );
+
+  // GET /recommendations/search?q=buku+sedih&n=10
+  router.get(
+    '/search',
+    optionalVerifyTokenMiddleware,
+    asyncHandler(async (req, res) => {
+      const { q, n = 10, language } = req.query;
+      if (!q?.trim()) return res.status(400).json({ success: false, error: 'q is required' });
+
+      const uid = req.user?.uid;
+      const params = new URLSearchParams({ q, n });
+      if (language) params.set('language', language);
+      if (uid) params.set('user_id', uid);
+
+      const result = await proxyToAI('GET', `/search/semantic?${params}`);
+      res.json({ success: true, data: result });
+    })
+  );
+
+  // GET /recommendations/similar-users?user_id=...&n=8
+  router.get(
+    '/similar-users',
+    verifyTokenMiddleware,
+    asyncHandler(async (req, res) => {
+      const { n = 8 } = req.query;
+      const uid = req.user.uid;
+      const params = new URLSearchParams({ user_id: uid, n });
+      const result = await proxyToAI('GET', `/recommendations/similar-users?${params}`);
+      res.json({ success: true, data: normalizeRecommendationsPayload(result) });
     })
   );
 

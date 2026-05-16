@@ -87,6 +87,111 @@ function isUuidLike(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || ''));
 }
 
+async function listBooks(req, res, { includeInactive = false } = {}) {
+  try {
+    const {
+      page = 1,
+      limit = 10,
+      genre,
+      search,
+      available,
+      language,
+      sort = 'created_at',
+      order = 'DESC',
+    } = req.query;
+    const pageNum = sanitizePagination(page, 1, 1, 100000);
+    const limitNum = sanitizePagination(limit, 10, 1, 100);
+    const offset = (pageNum - 1) * limitNum;
+
+    const baseWhere = includeInactive ? 'WHERE 1=1' : 'WHERE is_active = true';
+    let query = `SELECT * FROM books ${baseWhere}`;
+    const params = [];
+
+    if (search && String(search).trim()) {
+      const term = `%${String(search).trim()}%`;
+      query += ` AND (title ILIKE $${params.length + 1} OR authors::text ILIKE $${params.length + 1})`;
+      params.push(term);
+    }
+
+    if (genre) {
+      query += ` AND $${params.length + 1} = ANY(genres)`;
+      params.push(genre);
+    }
+
+    const availableFilter = parseBooleanQuery(available);
+    if (availableFilter === true) {
+      query += ' AND COALESCE(available, 0) > 0';
+    } else if (availableFilter === false) {
+      query += ' AND COALESCE(available, 0) <= 0';
+    }
+
+    if (language && String(language).trim()) {
+      query += ` AND language = $${params.length + 1}`;
+      params.push(String(language).trim());
+    }
+
+    const validSort = ['created_at', 'avg_rating', 'title', 'year'];
+    const validOrder = ['ASC', 'DESC'];
+    const sortBy = validSort.includes(sort) ? sort : 'created_at';
+    const orderBy = validOrder.includes(order.toUpperCase()) ? order.toUpperCase() : 'DESC';
+
+    query += ` ORDER BY ${sortBy} ${orderBy}`;
+    query += ` LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(limitNum, offset);
+
+    const result = await db.executeQuery(query, params);
+    const rows = toRows(result);
+
+    let countQuery = `SELECT COUNT(*) as total FROM books ${baseWhere}`;
+    const countParams = [];
+
+    if (search && String(search).trim()) {
+      const term = `%${String(search).trim()}%`;
+      countQuery += ` AND (title ILIKE $${countParams.length + 1} OR authors::text ILIKE $${countParams.length + 1})`;
+      countParams.push(term);
+    }
+
+    if (genre) {
+      countQuery += ` AND $${countParams.length + 1} = ANY(genres)`;
+      countParams.push(genre);
+    }
+
+    if (availableFilter === true) {
+      countQuery += ' AND COALESCE(available, 0) > 0';
+    } else if (availableFilter === false) {
+      countQuery += ' AND COALESCE(available, 0) <= 0';
+    }
+
+    if (language && String(language).trim()) {
+      countQuery += ` AND language = $${countParams.length + 1}`;
+      countParams.push(String(language).trim());
+    }
+
+    const countResult = await db.executeQuery(countQuery, countParams);
+    const countRows = toRows(countResult);
+
+    const totalItems = Number.parseInt(String(countRows[0]?.total || 0), 10) || 0;
+    const totalPages = Math.max(1, Math.ceil(totalItems / limitNum));
+    const booksData = rows.map((book) => withDownloadUrl(book, req));
+
+    return res.json({
+      success: true,
+      data: booksData,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total: totalItems,
+        pages: totalPages,
+        total_items: totalItems,
+        total_pages: totalPages,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching books:', error.message);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+}
+
 /**
  * Validate that the authenticated user has an active, unreturned, non-expired loan.
  */
@@ -350,109 +455,11 @@ exports.createOrUpdateReview = async (req, res) => {
 
 // GET /books - List all books dengan pagination & filters
 exports.getBooks = async (req, res) => {
-  try {
-    const {
-      page = 1,
-      limit = 10,
-      genre,
-      search,
-      available,
-      language,
-      sort = 'created_at',
-      order = 'DESC',
-    } = req.query;
-    const pageNum = sanitizePagination(page, 1, 1, 100000);
-    const limitNum = sanitizePagination(limit, 10, 1, 100);
-    const offset = (pageNum - 1) * limitNum;
-    
-    let query = 'SELECT * FROM books WHERE is_active = true';
-    const params = [];
+  return listBooks(req, res, { includeInactive: false });
+};
 
-    if (search && String(search).trim()) {
-      const term = `%${String(search).trim()}%`;
-      query += ` AND (title ILIKE $${params.length + 1} OR authors::text ILIKE $${params.length + 1})`;
-      params.push(term);
-    }
-
-    // Filter by genre jika ada
-    if (genre) {
-      query += ` AND $${params.length + 1} = ANY(genres)`;
-      params.push(genre);
-    }
-
-    const availableFilter = parseBooleanQuery(available);
-    if (availableFilter === true) {
-      query += ' AND COALESCE(available, 0) > 0';
-    } else if (availableFilter === false) {
-      query += ' AND COALESCE(available, 0) <= 0';
-    }
-
-    if (language && String(language).trim()) {
-      query += ` AND language = $${params.length + 1}`;
-      params.push(String(language).trim());
-    }
-
-    // Sort
-    const validSort = ['created_at', 'avg_rating', 'title', 'year'];
-    const validOrder = ['ASC', 'DESC'];
-    const sortBy = validSort.includes(sort) ? sort : 'created_at';
-    const orderBy = validOrder.includes(order.toUpperCase()) ? order.toUpperCase() : 'DESC';
-    
-    query += ` ORDER BY ${sortBy} ${orderBy}`;
-    query += ` LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
-    params.push(limitNum, offset);
-
-    const result = await db.executeQuery(query, params);
-    const rows = toRows(result);
-    
-    // Get total count
-    let countQuery = 'SELECT COUNT(*) as total FROM books WHERE is_active = true';
-    const countParams = [];
-
-    if (search && String(search).trim()) {
-      const term = `%${String(search).trim()}%`;
-      countQuery += ` AND (title ILIKE $${countParams.length + 1} OR authors::text ILIKE $${countParams.length + 1})`;
-      countParams.push(term);
-    }
-
-    if (genre) {
-      countQuery += ` AND $${countParams.length + 1} = ANY(genres)`;
-      countParams.push(genre);
-    }
-
-    if (availableFilter === true) {
-      countQuery += ' AND COALESCE(available, 0) > 0';
-    } else if (availableFilter === false) {
-      countQuery += ' AND COALESCE(available, 0) <= 0';
-    }
-
-    if (language && String(language).trim()) {
-      countQuery += ` AND language = $${countParams.length + 1}`;
-      countParams.push(String(language).trim());
-    }
-    const countResult = await db.executeQuery(countQuery, countParams);
-    const countRows = toRows(countResult);
-
-    const totalItems = Number.parseInt(String(countRows[0]?.total || 0), 10) || 0;
-    const totalPages = Math.max(1, Math.ceil(totalItems / limitNum));
-    const booksData = rows.map((book) => withDownloadUrl(book, req));
-
-    res.json({
-      success: true,
-      data: booksData,
-      pagination: {
-        page: pageNum,
-        limit: limitNum,
-        total: totalItems,
-        pages: totalPages,
-        total_items: totalItems,
-        total_pages: totalPages,
-      },
-    });
-  } catch (error) {
-    console.error('Error fetching books:', error.message);
-    res.status(500).json({ success: false, message: error.message });
-  }
+exports.getBooksAdmin = async (req, res) => {
+  return listBooks(req, res, { includeInactive: true });
 };
 
 // GET /books/:id/access - Validate reader access without streaming file content

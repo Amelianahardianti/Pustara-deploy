@@ -12,6 +12,7 @@ const booksController = require('../controllers/booksController');
 
 // routes/booksAdminRoutes.js
 
+router.get('/', booksController.getBooksAdmin);
 router.post('/', booksController.createBook);
 router.get('/without-file', booksController.getBooksWithoutFile);
 router.put('/top-picks', booksController.setTopPicks);
