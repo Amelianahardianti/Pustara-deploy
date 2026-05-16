@@ -98,6 +98,7 @@ async function ensureNeonShelfSchemaCompatibility() {
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS current_page INTEGER DEFAULT 0",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS total_pages INTEGER DEFAULT 0",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS reading_time_minutes INTEGER DEFAULT 0",
+    "CREATE TABLE IF NOT EXISTS login_events (id BIGSERIAL PRIMARY KEY, firebase_uid TEXT NOT NULL, login_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)",
     "ALTER TABLE IF EXISTS notifications ADD COLUMN IF NOT EXISTS body TEXT",
     "ALTER TABLE IF EXISTS notifications ADD COLUMN IF NOT EXISTS book_id UUID",
     "ALTER TABLE IF EXISTS notifications ADD COLUMN IF NOT EXISTS actor_id UUID",
@@ -327,6 +328,34 @@ async function createUsersTable() {
   }
 }
 
+async function createLoginEventsTable() {
+  if (isNeon) {
+    console.log('✅ Login events table — auto-create di-skip untuk Neon (pakai schema/runtime)');
+    return;
+  }
+
+  try {
+    const pool = getPool();
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'login_events')
+      BEGIN
+        CREATE TABLE login_events (
+          id INT PRIMARY KEY IDENTITY(1,1),
+          firebase_uid NVARCHAR(255) NOT NULL,
+          login_at DATETIME2 DEFAULT GETDATE()
+        );
+        CREATE INDEX idx_login_events_firebase_uid ON login_events(firebase_uid);
+        CREATE INDEX idx_login_events_login_at ON login_events(login_at);
+        PRINT 'login_events table created';
+      END
+    `);
+    console.log('✅ login_events table ready');
+  } catch (error) {
+    console.error('❌ Error creating login_events table:', error);
+    throw error;
+  }
+}
+
 async function createUserSurveyTable() {
   if (isNeon) {
     console.log('✅ UserSurvey — auto-create di-skip untuk Neon');
@@ -377,6 +406,7 @@ module.exports = {
   executeQuery,
   getPool,
   createUsersTable,
+  createLoginEventsTable,
   createUserSurveyTable,
   closeDatabase,
   isNeon,

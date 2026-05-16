@@ -111,6 +111,7 @@ function createAuthRoutes(authService, verifyTokenMiddleware) {
         // Get role from DB
         const roleResult = await UserService.getUserRole(uid);
         role = roleResult.success ? roleResult.role : 'reader';
+        await UserService.recordLoginEvent(uid);
         console.log(`[verify-token] uid=${uid} email=${email} role=${role}`);
       }
       

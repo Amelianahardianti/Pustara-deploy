@@ -170,6 +170,20 @@ class UserService {
     const result = await this.getUserByUid(uid);
     return result.success && result.data !== null;
   }
+
+  static async recordLoginEvent(uid) {
+    try {
+      await executeQuery(
+        `INSERT INTO login_events (firebase_uid, login_at)
+         VALUES ($1, CURRENT_TIMESTAMP)`,
+        [uid]
+      );
+      return { success: true };
+    } catch (error) {
+      console.warn('recordLoginEvent warning:', error.message);
+      return { success: false, error: error.message };
+    }
+  }
 }
 
 module.exports = UserService;

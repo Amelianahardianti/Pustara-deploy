@@ -369,7 +369,7 @@ function mapUserCard(user, isFollowing = false) {
 async function buildUserProfile(targetUserId, actorId = null) {
   const userRows = toRows(
     await db.executeQuery(
-      'SELECT id, username, display_name, email, bio, avatar_url, preferred_genres, reading_streak, total_read, created_at, updated_at FROM users WHERE id = $1',
+      'SELECT id, firebase_uid, username, display_name, email, bio, avatar_url, preferred_genres, reading_streak, total_read, created_at, updated_at FROM users WHERE id = $1',
       [targetUserId]
     )
   );
@@ -463,7 +463,10 @@ async function buildUserProfile(targetUserId, actorId = null) {
         `SELECT COUNT(*) AS total
          FROM reading_sessions
          WHERE user_id = $1
-           AND status = 'finished'`,
+           AND (
+             COALESCE(progress_percentage, 0) >= 100
+             OR COALESCE(current_page, 0) >= COALESCE(total_pages, 0)
+           )`,
         [targetUserId]
       )
     );
@@ -475,14 +478,13 @@ async function buildUserProfile(targetUserId, actorId = null) {
   try {
     const streakRows = toRows(
       await db.executeQuery(
-        `SELECT COALESCE(last_read_at, finished_at, started_at) AS event_time
-         FROM reading_sessions
-         WHERE user_id = $1
-           AND COALESCE(last_read_at, finished_at, started_at) IS NOT NULL
-           AND status IN ('reading', 'active', 'finished')
-         ORDER BY COALESCE(last_read_at, finished_at, started_at) DESC
+        `SELECT login_at AS event_time
+         FROM login_events
+         WHERE firebase_uid = $1
+           AND login_at IS NOT NULL
+         ORDER BY login_at DESC
          LIMIT 400`,
-        [targetUserId]
+        [user.firebase_uid || user.uid || user.email || targetUserId]
       )
     );
     const streakTimestamps = streakRows.map((row) => row.event_time);
@@ -504,7 +506,7 @@ async function buildUserProfile(targetUserId, actorId = null) {
   const storedStreak = Number(user.reading_streak || 0);
   const storedTotalRead = Number(user.total_read || 0);
   const resolvedStreak = Math.max(0, computedStreak, streakSummary.currentStreak);
-  const resolvedTotalRead = Math.max(0, storedTotalRead, finishedCount);
+  const resolvedTotalRead = Math.max(0, finishedCount);
 
   return {
     id: String(user.id),

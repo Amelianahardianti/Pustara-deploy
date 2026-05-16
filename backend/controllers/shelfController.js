@@ -56,6 +56,16 @@ function formatBook(row) {
   };
 }
 
+async function safeRows(query, params, label) {
+  try {
+    const result = await db.executeQuery(query, params);
+    return toRows(result);
+  } catch (error) {
+    console.error(`Error fetching shelf ${label}:`, error.message);
+    return [];
+  }
+}
+
 async function resolveActorUserId(req) {
   if (!req.user?.uid) return null;
 
@@ -188,8 +198,8 @@ async function ensureReadingSession(userId, bookId) {
   const createdRows = toRows(
     await db.executeQuery(
       `INSERT INTO reading_sessions
-       (user_id, book_id, current_page, total_pages, progress_percentage, status, started_at, last_read_at)
-       VALUES ($1, $2, $3, $4, 0, 'reading', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       (user_id, book_id, current_page, total_pages, progress_percentage, status, started_at)
+       VALUES ($1, $2, $3, $4, 0, 'reading', CURRENT_TIMESTAMP)
        RETURNING id, started_at`,
       [userId, bookId, initialPage, totalPages]
     )
@@ -368,6 +378,28 @@ exports.returnBook = async (req, res) => {
       });
     }
 
+    const sessionRows = toRows(
+      await db.executeQuery(
+        `SELECT id, status, current_page, total_pages, progress_percentage, finished_at
+         FROM reading_sessions
+         WHERE user_id = $1 AND book_id = $2
+         ORDER BY COALESCE(finished_at, last_read_at, started_at) DESC
+         LIMIT 1`,
+        [actorUserId, activeLoan.book_id]
+      )
+    );
+    const latestSession = sessionRows[0] || null;
+    const progressPercentage = Number(latestSession?.progress_percentage || 0);
+    const currentPage = Number(latestSession?.current_page || 0);
+    const totalPages = Number(latestSession?.total_pages || 0);
+    const sessionIsFinished = Boolean(
+      latestSession && (
+        String(latestSession.status || '').toLowerCase() === 'finished' ||
+        progressPercentage >= 100 ||
+        (totalPages > 0 && currentPage >= totalPages)
+      )
+    );
+
     await db.executeQuery(
       `UPDATE loans
        SET returned_at = CURRENT_TIMESTAMP, status = 'returned'
@@ -380,13 +412,20 @@ exports.returnBook = async (req, res) => {
       [activeLoan.book_id]
     );
 
-    await db.executeQuery(
-      `UPDATE reading_sessions
-      SET status = 'finished',
-          finished_at = CURRENT_TIMESTAMP
-      WHERE user_id = $1 AND book_id = $2 AND status IN ('reading', 'active', 'paused')`,
-      [actorUserId, activeLoan.book_id]
-    );
+    if (latestSession?.id) {
+      await db.executeQuery(
+        sessionIsFinished
+          ? `UPDATE reading_sessions
+             SET status = 'finished',
+                 finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP),
+                 progress_percentage = GREATEST(COALESCE(progress_percentage, 0), 100)
+             WHERE id = $1 AND user_id = $2`
+          : `UPDATE reading_sessions
+             SET status = CASE WHEN status = 'finished' THEN status ELSE 'paused' END
+             WHERE id = $1 AND user_id = $2 AND status IN ('reading', 'active', 'paused')`,
+        [latestSession.id, actorUserId]
+      );
+    }
     
     const returnedBookRows = toRows(
       await db.executeQuery('SELECT title FROM books WHERE id = $1 LIMIT 1', [activeLoan.book_id])
@@ -593,16 +632,10 @@ exports.getMyShelf = async (req, res) => {
       return res.status(401).json({ success: false, message: 'Authentication required' });
     }
 
-    const [
-      borrowedRows,
-      readingNowRows,
-      historyRows,
-      wishlistRows,
-    ] = await Promise.all([
+    const [borrowedRows, readingNowRows, historyRows, wishlistRows] = await Promise.all([
       // Active loans
-      toRows(
-        await db.executeQuery(
-          `SELECT * FROM (
+      safeRows(
+        `SELECT * FROM (
              SELECT DISTINCT ON (b.id) 
                     b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
                     l.id as loan_id, l.borrowed_at, COALESCE(l.due_date, l.due_at) AS due_date, l.returned_at,
@@ -620,13 +653,12 @@ exports.getMyShelf = async (req, res) => {
              ORDER BY b.id, l.borrowed_at DESC
            ) sub
            ORDER BY borrowed_at DESC`,
-          [actorUserId]
-        )
+        [actorUserId],
+        'borrowed'
       ),
       // Currently reading sessions
-      toRows(
-        await db.executeQuery(
-          `SELECT * FROM (
+      safeRows(
+        `SELECT * FROM (
              SELECT DISTINCT ON (b.id) 
                     b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
                     rs.id as session_id, rs.current_page, rs.total_pages, 
@@ -644,13 +676,12 @@ exports.getMyShelf = async (req, res) => {
              ORDER BY b.id, rs.last_read_at DESC NULLS LAST, rs.started_at DESC
            ) sub
            ORDER BY last_read_at DESC NULLS LAST`,
-          [actorUserId]
-        )
+        [actorUserId],
+        'reading'
       ),
       // History items: returned loans + finished reading sessions that are not tied to a returned loan
-      toRows(
-        await db.executeQuery(
-          `SELECT * FROM (
+      safeRows(
+        `SELECT * FROM (
              SELECT
                b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
                l.id AS loan_id,
@@ -668,10 +699,10 @@ exports.getMyShelf = async (req, res) => {
                  WHEN l.returned_at IS NOT NULL
                   AND COALESCE(l.due_date, l.due_at) IS NOT NULL
                   AND l.returned_at > COALESCE(l.due_date, l.due_at) THEN 'overdue'
-                 WHEN rs.id IS NOT NULL
-                  AND (COALESCE(rs.progress_percentage, 0) < 100
-                    OR COALESCE(rs.current_page, 0) < COALESCE(rs.total_pages, 0)) THEN 'unfinished'
-                 ELSE 'finished'
+                 WHEN rs.id IS NULL THEN 'unfinished'
+                 WHEN COALESCE(rs.progress_percentage, 0) >= 100
+                   OR COALESCE(rs.current_page, 0) >= COALESCE(rs.total_pages, 0) THEN 'finished'
+                 ELSE 'unfinished'
                END AS history_status,
                COALESCE(l.returned_at, rs.finished_at) AS history_at
              FROM loans l
@@ -722,10 +753,13 @@ exports.getMyShelf = async (req, res) => {
                )
            ) sub
            ORDER BY history_at DESC NULLS LAST`,
-          [actorUserId]
-        )
+        [actorUserId],
+        'history'
       ),
-      getWishlistRowsByUser(actorUserId),
+      getWishlistRowsByUser(actorUserId).catch((error) => {
+        console.error('Error fetching shelf wishlist:', error.message);
+        return [];
+      }),
     ]);
 
     const pinjaman = borrowedRows.map((row) => ({
@@ -788,7 +822,7 @@ exports.getMyShelf = async (req, res) => {
           total_borrowed: pinjaman.length,
           total_reading: dibaca.length,
           total_wishlist: wishlist.length,
-          total_read: riwayat.length,
+          total_read: riwayat.filter((item) => String(item.status || '').toLowerCase() === 'finished').length,
           total_overdue: riwayat.filter((item) => String(item.status || '').toLowerCase() === 'overdue').length,
         },
       },

@@ -184,6 +184,8 @@ class AuthService {
       }
     }
 
+    await UserService.recordLoginEvent(uid);
+
     return {
       success: true,
       token: result.data.idToken,
