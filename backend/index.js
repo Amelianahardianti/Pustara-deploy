@@ -49,6 +49,7 @@ const analyticsRoutes = require('./routes/analyticsRoutes');
 const userRoutes = require('./routes/userRoutes');
 const shelfRoutes = require('./routes/shelfRoutes');
 const feedRoutes = require('./routes/feedRoutes');
+const reviewsRoutes = require('./routes/reviewsRoutes');
 
 require('./jobs/cron'); //init cron jobs for ai-related tasks
 
@@ -61,7 +62,7 @@ const app = express();
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
   
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
@@ -80,7 +81,7 @@ app.use(fileUpload({
 }));
 app.use(cors({
   origin: CONFIG.CORS_ORIGINS || "http://localhost:3001",
-  methods: ["GET", "POST", "PUT", "DELETE"],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
 }));
@@ -138,6 +139,12 @@ app.use('/shelf', verifyTokenMiddleware, shelfRoutes);
 
 // Feed Routes (activity, notifications, recommendations)
 app.use('/feed', verifyTokenMiddleware, feedRoutes);
+
+// Public Reviews (recent community reviews for homepage widgets)
+app.use('/reviews', optionalVerifyTokenMiddleware, reviewsRoutes);
+
+// Also mount reviews routes under /community so front-end can request /community/reviews
+app.use('/community', optionalVerifyTokenMiddleware, reviewsRoutes);
 
 // User Social/Profile Routes (allow optional auth for actor-aware responses)
 app.use('/users', optionalVerifyTokenMiddleware, userRoutes);

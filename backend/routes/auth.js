@@ -28,6 +28,8 @@ const asyncHandler = (fn) => (req, res, next) => {
 function createAuthRoutes(authService, verifyTokenMiddleware) {
   const router = express.Router();
   const UserService = require("../services/userService");
+  const { insertNotification } = require("../services/notificationService");
+  const { sendEmail } = require("../services/emailService");
   const authRateLimiter = createIPRateLimiter(
     CONFIG.RATE_LIMIT.AUTH.window,
     CONFIG.RATE_LIMIT.AUTH.max
@@ -72,7 +74,37 @@ function createAuthRoutes(authService, verifyTokenMiddleware) {
         const userExists = await UserService.getUserByUid(uid);
         if (!userExists.data) {
           console.log(`📝 First login detected for ${email}, syncing to Azure SQL...`);
-          await UserService.createUser(uid, email, displayName);
+          const created = await UserService.createUser(uid, email, displayName);
+          try {
+            const createdUserId = created?.data?.id;
+            const name = displayName || email?.split('@')[0] || 'Pustara Reader';
+
+            if (createdUserId) {
+              await insertNotification({
+                userId: String(createdUserId),
+                type: 'system',
+                title: 'Selamat Datang di Pustara',
+                body: 'Akunmu sudah siap. Mulai jelajahi katalog, simpan wishlist, dan pinjam buku pertama kamu.',
+              });
+            }
+
+            await sendEmail({
+              to: email,
+              subject: 'Pustara - Selamat Datang',
+              text: [
+                `Halo ${name},`,
+                '',
+                'Selamat datang di Pustara. Akunmu sudah aktif dan siap dipakai.',
+                'Kamu bisa mulai eksplor katalog, membuat wishlist, dan meminjam buku digital.',
+                '',
+                'Selamat membaca!',
+              ].join('\n'),
+            }).catch((mailError) => {
+              console.warn('Welcome email warning:', mailError.message);
+            });
+          } catch (welcomeError) {
+            console.warn('Welcome notification warning:', welcomeError.message);
+          }
           console.log(`✅ User synced successfully`);
         }
         

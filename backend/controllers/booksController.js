@@ -172,11 +172,15 @@ exports.getBookReviews = async (req, res) => {
         r.rating,
         r.body as text,
         r.created_at as time,
-        u.display_name as name,
-        COALESCE(u.display_name, 'U') as avatar
+        COALESCE(u.display_name, u.username) as name,
+        u.avatar_url,
+        COALESCE(u.display_name, u.username, 'U') as avatar,
+        COUNT(rl.review_id) as likes
       FROM reviews r
       JOIN users u ON r.user_id = u.id
+      LEFT JOIN review_likes rl ON rl.review_id = r.id
       WHERE r.book_id = $1
+      GROUP BY r.id, u.display_name, u.username, u.avatar_url
       ORDER BY r.created_at DESC
       LIMIT $2 OFFSET $3
     `;

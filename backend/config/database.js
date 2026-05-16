@@ -98,6 +98,10 @@ async function ensureNeonShelfSchemaCompatibility() {
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS current_page INTEGER DEFAULT 0",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS total_pages INTEGER DEFAULT 0",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS reading_time_minutes INTEGER DEFAULT 0",
+    "ALTER TABLE IF EXISTS notifications ADD COLUMN IF NOT EXISTS body TEXT",
+    "ALTER TABLE IF EXISTS notifications ADD COLUMN IF NOT EXISTS book_id UUID",
+    "ALTER TABLE IF EXISTS notifications ADD COLUMN IF NOT EXISTS actor_id UUID",
+    "ALTER TABLE IF EXISTS notifications ADD COLUMN IF NOT EXISTS read BOOLEAN DEFAULT false",
   ];
 
   for (const statement of safeStatements) {
@@ -187,6 +191,8 @@ async function ensureNeonShelfSchemaCompatibility() {
        END IF;
      END $$;`,
     `UPDATE reading_sessions SET status = COALESCE(status, 'reading') WHERE status IS NULL`,
+    `UPDATE notifications SET body = COALESCE(body, message) WHERE body IS NULL`,
+    `UPDATE notifications SET read = COALESCE(read, is_read, false) WHERE read IS NULL`,
   ];
 
   for (const statement of backfillBlocks) {

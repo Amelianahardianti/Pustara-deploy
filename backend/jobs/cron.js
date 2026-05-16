@@ -295,6 +295,104 @@ async function sendLoanDeadlineReminders() {
   }
 }
 
+async function autoReturnExpiredLoans() {
+  log('LOANS', 'Auto-returning expired loans...');
+  try {
+    const expiredLoans = isNeon
+      ? toRows(await executeQuery(`
+          UPDATE loans l
+          SET returned_at = CURRENT_TIMESTAMP,
+              status = 'returned'
+          FROM books b
+          WHERE b.id = l.book_id
+            AND l.returned_at IS NULL
+            AND l.status IN ('active', 'extended', 'overdue')
+            AND COALESCE(l.due_date, l.due_at) <= CURRENT_TIMESTAMP
+          RETURNING l.id::text AS loan_id,
+                    l.user_id::text AS user_id,
+                    l.book_id::text AS book_id,
+                    COALESCE(l.due_date, l.due_at) AS due_at,
+                    b.title AS book_title
+        `))
+      : toRows(await executeQuery(`
+          UPDATE l
+          SET returned_at = GETDATE(),
+              status = 'returned'
+          OUTPUT CAST(inserted.id AS NVARCHAR(255)) AS loan_id,
+                 CAST(inserted.user_id AS NVARCHAR(255)) AS user_id,
+                 CAST(inserted.book_id AS NVARCHAR(255)) AS book_id,
+                 COALESCE(inserted.due_date, inserted.due_at) AS due_at,
+                 b.title AS book_title
+          FROM loans l
+          JOIN books b ON b.id = l.book_id
+          WHERE l.returned_at IS NULL
+            AND l.status IN ('active', 'extended', 'overdue')
+            AND COALESCE(l.due_date, l.due_at) <= GETDATE()
+        `));
+
+    if (expiredLoans.length === 0) {
+      log('LOANS', 'No expired loans to auto-return.');
+      return;
+    }
+
+    for (const loan of expiredLoans) {
+      try {
+        await executeQuery(
+          isNeon
+            ? `UPDATE books
+               SET available = LEAST(COALESCE(available, 0) + 1, COALESCE(total_stock, available + 1))
+               WHERE id::text = $1`
+            : `UPDATE books
+               SET available = CASE
+                 WHEN COALESCE(available, 0) + 1 > COALESCE(total_stock, available + 1)
+                 THEN COALESCE(total_stock, available + 1)
+                 ELSE COALESCE(available, 0) + 1
+               END
+               WHERE CAST(id AS NVARCHAR(255)) = $1`,
+          [String(loan.book_id)]
+        );
+
+        await executeQuery(
+          isNeon
+            ? `UPDATE reading_sessions
+               SET status = 'paused',
+                   last_read_at = CURRENT_TIMESTAMP
+               WHERE user_id::text = $1
+                 AND book_id::text = $2
+                 AND status IN ('reading', 'active')`
+            : `UPDATE reading_sessions
+               SET status = 'paused',
+                   last_read_at = GETDATE()
+               WHERE CAST(user_id AS NVARCHAR(255)) = $1
+                 AND CAST(book_id AS NVARCHAR(255)) = $2
+                 AND status IN ('reading', 'active')`,
+          [String(loan.user_id), String(loan.book_id)]
+        );
+
+        await insertNotification({
+          userId: String(loan.user_id),
+          type: 'due',
+          title: 'Akses Baca Berakhir',
+          body: `Masa pinjam buku "${loan.book_title || 'Buku'}" sudah selesai, jadi akses bacanya otomatis ditutup. Kamu bisa meminjam ulang kalau ingin lanjut membaca.`,
+          bookId: String(loan.book_id),
+          data: {
+            book_id: String(loan.book_id),
+            loan_id: String(loan.loan_id),
+            due_at: loan.due_at || null,
+            action: 'reborrow',
+          },
+        });
+      } catch (loanError) {
+        log('LOANS', `Auto-return post-processing warning for ${loan.loan_id}: ${loanError.message}`);
+      }
+    }
+
+    log('LOANS', `Auto-returned ${expiredLoans.length} expired loans.`);
+  } catch (error) {
+    log('LOANS', `Auto-return error: ${error.message}`);
+  }
+}
+
 function makeSyntheticIdentity(firebaseUid) {
   const raw = String(firebaseUid || '').trim();
   const safe = raw.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
@@ -512,6 +610,7 @@ cron.schedule('0 3 * * *', async () => {
 // Job 5: Due-date reminders + overdue status sync — every hour
 // ─────────────────────────────────────────────────────────────
 cron.schedule('15 * * * *', async () => {
+  await autoReturnExpiredLoans();
   await sendLoanDeadlineReminders();
 }, { timezone: 'Asia/Jakarta' });
 

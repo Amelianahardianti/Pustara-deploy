@@ -596,7 +596,7 @@ exports.getMyShelf = async (req, res) => {
     const [
       borrowedRows,
       readingNowRows,
-      finishedRows,
+      historyRows,
       wishlistRows,
     ] = await Promise.all([
       // Active loans
@@ -606,6 +606,7 @@ exports.getMyShelf = async (req, res) => {
              SELECT DISTINCT ON (b.id) 
                     b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
                     l.id as loan_id, l.borrowed_at, COALESCE(l.due_date, l.due_at) AS due_date, l.returned_at,
+                    l.status as loan_status,
                     COALESCE(rs.progress_percentage, 0) as progress_percentage
              FROM loans l
              JOIN books b ON b.id = l.book_id
@@ -615,7 +616,7 @@ exports.getMyShelf = async (req, res) => {
                WHERE book_id = l.book_id AND user_id = l.user_id AND status IN ('reading', 'active', 'paused')
                ORDER BY started_at DESC LIMIT 1
              ) rs ON true
-             WHERE l.user_id = $1 AND b.is_active = true AND l.returned_at IS NULL
+             WHERE l.user_id = $1 AND b.is_active = true AND l.returned_at IS NULL AND l.status IN ('active', 'extended')
              ORDER BY b.id, l.borrowed_at DESC
            ) sub
            ORDER BY borrowed_at DESC`,
@@ -646,21 +647,81 @@ exports.getMyShelf = async (req, res) => {
           [actorUserId]
         )
       ),
-      // Finished reading sessions (Riwayat)
+      // History items: returned loans + finished reading sessions that are not tied to a returned loan
       toRows(
         await db.executeQuery(
           `SELECT * FROM (
-             SELECT b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
-                    rs.id as session_id, rs.current_page, rs.total_pages, 
-                    rs.progress_percentage, rs.finished_at, rs.started_at, rs.reading_time_minutes
+             SELECT
+               b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
+               l.id AS loan_id,
+               l.borrowed_at,
+               COALESCE(l.due_date, l.due_at) AS due_date,
+               l.returned_at,
+               rs.id AS session_id,
+               rs.current_page,
+               rs.total_pages,
+               rs.progress_percentage,
+               rs.finished_at,
+               rs.started_at,
+               rs.reading_time_minutes,
+               CASE
+                 WHEN l.returned_at IS NOT NULL
+                  AND COALESCE(l.due_date, l.due_at) IS NOT NULL
+                  AND l.returned_at > COALESCE(l.due_date, l.due_at) THEN 'overdue'
+                 WHEN rs.id IS NOT NULL
+                  AND (COALESCE(rs.progress_percentage, 0) < 100
+                    OR COALESCE(rs.current_page, 0) < COALESCE(rs.total_pages, 0)) THEN 'unfinished'
+                 ELSE 'finished'
+               END AS history_status,
+               COALESCE(l.returned_at, rs.finished_at) AS history_at
+             FROM loans l
+             JOIN books b ON b.id = l.book_id
+             LEFT JOIN LATERAL (
+               SELECT id, current_page, total_pages, progress_percentage, finished_at, started_at, reading_time_minutes
+               FROM reading_sessions
+               WHERE book_id = l.book_id AND user_id = l.user_id
+               ORDER BY COALESCE(finished_at, last_read_at, started_at) DESC
+               LIMIT 1
+             ) rs ON true
+             WHERE l.user_id = $1
+               AND b.is_active = true
+               AND l.returned_at IS NOT NULL
+
+             UNION ALL
+
+             SELECT
+               b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
+               NULL AS loan_id,
+               NULL AS borrowed_at,
+               NULL AS due_date,
+               NULL AS returned_at,
+               rs.id AS session_id,
+               rs.current_page,
+               rs.total_pages,
+               rs.progress_percentage,
+               rs.finished_at,
+               rs.started_at,
+               rs.reading_time_minutes,
+               CASE
+                 WHEN COALESCE(rs.progress_percentage, 0) < 100
+                  OR COALESCE(rs.current_page, 0) < COALESCE(rs.total_pages, 0) THEN 'unfinished'
+                 ELSE 'finished'
+               END AS history_status,
+               rs.finished_at AS history_at
              FROM reading_sessions rs
              JOIN books b ON b.id = rs.book_id
              WHERE rs.user_id = $1
                AND b.is_active = true
                AND rs.status = 'finished'
-             ORDER BY b.id, rs.finished_at DESC NULLS LAST
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM loans l
+                 WHERE l.book_id = rs.book_id
+                   AND l.user_id = rs.user_id
+                   AND l.returned_at IS NOT NULL
+               )
            ) sub
-           ORDER BY finished_at DESC NULLS LAST`,
+           ORDER BY history_at DESC NULLS LAST`,
           [actorUserId]
         )
       ),
@@ -673,6 +734,7 @@ exports.getMyShelf = async (req, res) => {
       borrowed_at: row.borrowed_at || null,
       due_date: row.due_date || null,
       returned_at: row.returned_at || null,
+      status: String(row.loan_status || 'active'),
       progress: Number(row.progress_percentage || 0),
       progress_percentage: Number(row.progress_percentage || 0),
       days_left: row.due_date
@@ -690,15 +752,23 @@ exports.getMyShelf = async (req, res) => {
       started_at: row.started_at || null,
     }));
 
-    const riwayat = finishedRows.map((row) => ({
+    const riwayat = historyRows.map((row) => ({
       ...formatBook(row),
-      session_id: String(row.session_id || ''),
+      loan_id: row.loan_id ? String(row.loan_id) : null,
+      session_id: row.session_id ? String(row.session_id) : null,
+      returned_at: row.returned_at || null,
       finished_at: row.finished_at || null,
       started_at: row.started_at || null,
       reading_time_minutes: Number(row.reading_time_minutes || 0),
+      progress_percentage: Number(row.progress_percentage || 0),
+      current_page: Number(row.current_page || 0),
+      total_pages: Number(row.total_pages || 0),
+      status: String(row.history_status || 'finished'),
       days_read: row.started_at && row.finished_at
         ? Math.max(1, Math.floor((new Date(row.finished_at) - new Date(row.started_at)) / (1000 * 60 * 60 * 24)))
-        : null,
+        : row.borrowed_at && row.returned_at
+          ? Math.max(1, Math.floor((new Date(row.returned_at) - new Date(row.borrowed_at)) / (1000 * 60 * 60 * 24)))
+          : null,
     }));
 
     const wishlist = wishlistRows.map((row) => ({
@@ -714,6 +784,13 @@ exports.getMyShelf = async (req, res) => {
         dibaca,
         riwayat,
         wishlist,
+        stats: {
+          total_borrowed: pinjaman.length,
+          total_reading: dibaca.length,
+          total_wishlist: wishlist.length,
+          total_read: riwayat.length,
+          total_overdue: riwayat.filter((item) => String(item.status || '').toLowerCase() === 'overdue').length,
+        },
       },
     });
   } catch (error) {

@@ -203,40 +203,62 @@ exports.getMyNotifications = async (req, res) => {
     const limit = Math.min(Number(req.query.limit) || 20, 100);
 
     let notificationRows = [];
-    try {
-      notificationRows = toRows(
-        await db.executeQuery(
-          `SELECT
-             id, user_id, type, title,
-             body, message,
-             book_id, related_book_id,
-             actor_id, related_user_id,
-             read, is_read,
-             created_at
-           FROM notifications
-           WHERE user_id = $1
-           ORDER BY created_at DESC
-           LIMIT $2`,
-          [actorUserId, limit]
-        )
-      );
-    } catch (_) {
-      notificationRows = toRows(
-        await db.executeQuery(
-          `SELECT TOP 100
-             id, user_id, type, title,
-             body, message,
-             book_id, related_book_id,
-             actor_id, related_user_id,
-             read, is_read,
-             created_at
-           FROM notifications
-           WHERE user_id = $1
-           ORDER BY created_at DESC`,
-          [actorUserId]
-        )
-      ).slice(0, limit);
+    const queryVariants = [
+      {
+        sql: `SELECT
+               id, user_id, type, title,
+               body, NULL AS message,
+               book_id, NULL AS related_book_id,
+               actor_id, NULL AS related_user_id,
+               read, NULL AS is_read,
+               created_at
+             FROM notifications
+             WHERE user_id = $1
+             ORDER BY created_at DESC
+             LIMIT $2`,
+        params: [actorUserId, limit],
+      },
+      {
+        sql: `SELECT
+               id, user_id, type, title,
+               NULL AS body, message,
+               book_id, NULL AS related_book_id,
+               actor_id, NULL AS related_user_id,
+               NULL AS read, is_read,
+               created_at
+             FROM notifications
+             WHERE user_id = $1
+             ORDER BY created_at DESC
+             LIMIT $2`,
+        params: [actorUserId, limit],
+      },
+      {
+        sql: `SELECT TOP 100
+               id, user_id, type, title,
+               body, NULL AS message,
+               book_id, NULL AS related_book_id,
+               actor_id, NULL AS related_user_id,
+               read, NULL AS is_read,
+               created_at
+             FROM notifications
+             WHERE user_id = $1
+             ORDER BY created_at DESC`,
+        params: [actorUserId],
+      },
+    ];
+
+    let lastError = null;
+    for (const variant of queryVariants) {
+      try {
+        notificationRows = toRows(await db.executeQuery(variant.sql, variant.params)).slice(0, limit);
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+      }
     }
+
+    if (lastError) throw lastError;
 
     const notifications = notificationRows.map((row) => ({
       id: String(row.id || ''),
@@ -266,6 +288,146 @@ exports.getMyNotifications = async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to fetch notifications',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * PATCH /feed/me/notifications/read
+ * Marks one notification or all notifications as read.
+ */
+exports.markMyNotificationsRead = async (req, res) => {
+  try {
+    const actorUserId = await resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required',
+      });
+    }
+
+    const notificationId = req.params.notificationId || req.body?.notificationId || req.body?.id || null;
+    const markAll = Boolean(req.body?.all) || !notificationId;
+
+    const queryVariants = markAll
+      ? [
+          {
+            sql: `UPDATE notifications
+                  SET read = true
+                  WHERE user_id = $1
+                  RETURNING id`,
+            params: [actorUserId],
+          },
+          {
+            sql: `UPDATE notifications
+                  SET is_read = true
+                  WHERE user_id = $1
+                  RETURNING id`,
+            params: [actorUserId],
+          },
+          {
+            sql: `UPDATE notifications
+                  SET read = 1
+                  WHERE user_id = $1`,
+            params: [actorUserId],
+          },
+        ]
+      : [
+          {
+            sql: `UPDATE notifications
+                  SET read = true
+                  WHERE user_id = $1 AND id = $2
+                  RETURNING id`,
+            params: [actorUserId, notificationId],
+          },
+          {
+            sql: `UPDATE notifications
+                  SET is_read = true
+                  WHERE user_id = $1 AND id = $2
+                  RETURNING id`,
+            params: [actorUserId, notificationId],
+          },
+          {
+            sql: `UPDATE notifications
+                  SET read = 1
+                  WHERE user_id = $1 AND id = $2`,
+            params: [actorUserId, notificationId],
+          },
+        ];
+
+    let updated = [];
+    let lastError = null;
+    for (const variant of queryVariants) {
+      try {
+        updated = toRows(await db.executeQuery(variant.sql, variant.params));
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    if (lastError) throw lastError;
+
+    res.json({
+      success: true,
+      data: {
+        read: true,
+        all: markAll,
+        notification_id: notificationId ? String(notificationId) : null,
+        updated: updated.length,
+      },
+    });
+  } catch (error) {
+    console.error('Error marking notifications read:', error.message);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to mark notifications read',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * DELETE /feed/me/notifications/:notificationId
+ * Deletes one notification owned by the authenticated user.
+ */
+exports.deleteMyNotification = async (req, res) => {
+  try {
+    const actorUserId = await resolveActorUserId(req);
+    if (!actorUserId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required',
+      });
+    }
+
+    const { notificationId } = req.params;
+    if (!notificationId) {
+      return res.status(400).json({
+        success: false,
+        message: 'notificationId is required',
+      });
+    }
+
+    await db.executeQuery(
+      'DELETE FROM notifications WHERE user_id = $1 AND id = $2',
+      [actorUserId, notificationId]
+    );
+
+    res.json({
+      success: true,
+      data: {
+        deleted: true,
+        notification_id: String(notificationId),
+      },
+    });
+  } catch (error) {
+    console.error('Error deleting notification:', error.message);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to delete notification',
       error: error.message,
     });
   }

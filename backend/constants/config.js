@@ -10,7 +10,7 @@ const CONFIG = {
   // CORS
   CORS_ORIGINS: process.env.CORS_ORIGINS 
     ? process.env.CORS_ORIGINS.split(",").map(origin => origin.trim()) 
-    : ["http://localhost:3001"],
+    : ["http://localhost:3000", "http://localhost:3001"],
     
   // Firebase
   FIREBASE_PROJECT_ID: process.env.FIREBASE_PROJECT_ID,

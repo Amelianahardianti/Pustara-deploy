@@ -1,5 +1,7 @@
 const db = require('../config/database');
 const UserService = require('../services/userService');
+const { insertNotification, getUserContact } = require('../services/notificationService');
+const { sendEmail } = require('../services/emailService');
 
 function toRows(result) {
   if (Array.isArray(result)) return result;
@@ -197,6 +199,79 @@ function calculateConsecutiveStreak(timestamps) {
   return streak;
 }
 
+function nextDayKey(dayKey) {
+  if (!dayKey) return null;
+  const date = dayKeyToUtcDate(dayKey);
+  if (!date) return null;
+  date.setUTCDate(date.getUTCDate() + 1);
+  return toDayKeyInTimeZone(date);
+}
+
+function buildStreakSummary(timestamps) {
+  if (!Array.isArray(timestamps) || timestamps.length === 0) {
+    return {
+      currentStreak: 0,
+      isActiveToday: false,
+      lastActiveDayKey: null,
+      lastStreakStartDayKey: null,
+      lastStreakEndDayKey: null,
+      lastStreakLength: 0,
+      resetDayKey: null,
+    };
+  }
+
+  const days = new Set();
+  for (const ts of timestamps) {
+    const key = toDayKeyInTimeZone(ts);
+    if (key) days.add(key);
+  }
+
+  if (days.size === 0) {
+    return {
+      currentStreak: 0,
+      isActiveToday: false,
+      lastActiveDayKey: null,
+      lastStreakStartDayKey: null,
+      lastStreakEndDayKey: null,
+      lastStreakLength: 0,
+      resetDayKey: null,
+    };
+  }
+
+  const sortedDays = Array.from(days).sort((a, b) => {
+    const da = dayKeyToUtcDate(a);
+    const db = dayKeyToUtcDate(b);
+    return (db?.getTime() || 0) - (da?.getTime() || 0);
+  });
+
+  const latestDayKey = sortedDays[0];
+  const todayDayKey = toDayKeyInTimeZone(new Date());
+  let streakLength = 1;
+
+  for (let i = 1; i < sortedDays.length; i += 1) {
+    const diff = diffDays(sortedDays[i - 1], sortedDays[i]);
+    if (diff === 1) {
+      streakLength += 1;
+      continue;
+    }
+    break;
+  }
+
+  const lastStreakEndDayKey = latestDayKey;
+  const lastStreakStartDayKey = sortedDays[Math.max(0, streakLength - 1)];
+  const isActiveToday = Boolean(todayDayKey && latestDayKey === todayDayKey);
+
+  return {
+    currentStreak: isActiveToday ? streakLength : 0,
+    isActiveToday,
+    lastActiveDayKey: latestDayKey,
+    lastStreakStartDayKey,
+    lastStreakEndDayKey,
+    lastStreakLength: streakLength,
+    resetDayKey: isActiveToday ? null : nextDayKey(lastStreakEndDayKey),
+  };
+}
+
 async function resolveActorUserId(req) {
   if (!req.user?.uid) return null;
 
@@ -262,6 +337,21 @@ async function countFollowing(userId) {
   return Number(rows[0]?.total || 0);
 }
 
+async function getUserDisplaySummary(userId) {
+  const rows = toRows(
+    await db.executeQuery(
+      'SELECT id, username, display_name, email FROM users WHERE id = $1 LIMIT 1',
+      [userId]
+    )
+  );
+  if (rows.length === 0) return { name: 'Pustara Reader', username: '' };
+  const identity = buildPublicIdentity(rows[0]);
+  return {
+    name: identity.display_name,
+    username: identity.username,
+  };
+}
+
 function mapUserCard(user, isFollowing = false) {
   return {
     id: String(user.id),
@@ -311,6 +401,14 @@ async function buildUserProfile(targetUserId, actorId = null) {
   let likedBooks = [];
   let finishedCount = 0;
   let computedStreak = 0;
+  let streakSummary = {
+    currentStreak: 0,
+    isActiveToday: false,
+    lastActiveDayKey: null,
+    lastStreakStartDayKey: null,
+    lastStreakEndDayKey: null,
+    resetDayKey: null,
+  };
 
   try {
     const readingRows = toRows(
@@ -387,14 +485,25 @@ async function buildUserProfile(targetUserId, actorId = null) {
         [targetUserId]
       )
     );
-    computedStreak = calculateConsecutiveStreak(streakRows.map((row) => row.event_time));
+    const streakTimestamps = streakRows.map((row) => row.event_time);
+    computedStreak = calculateConsecutiveStreak(streakTimestamps);
+    streakSummary = buildStreakSummary(streakTimestamps);
   } catch (_) {
     computedStreak = 0;
+    streakSummary = {
+      currentStreak: 0,
+      isActiveToday: false,
+      lastActiveDayKey: null,
+      lastStreakStartDayKey: null,
+      lastStreakEndDayKey: null,
+      lastStreakLength: 0,
+      resetDayKey: null,
+    };
   }
 
   const storedStreak = Number(user.reading_streak || 0);
   const storedTotalRead = Number(user.total_read || 0);
-  const resolvedStreak = computedStreak > 0 ? computedStreak : Math.max(0, storedStreak);
+  const resolvedStreak = Math.max(0, computedStreak, streakSummary.currentStreak);
   const resolvedTotalRead = Math.max(0, storedTotalRead, finishedCount);
 
   return {
@@ -415,6 +524,12 @@ async function buildUserProfile(targetUserId, actorId = null) {
     is_following: isFollowing,
     currently_reading: currentlyReading,
     liked_books: likedBooks,
+    streak_is_active: streakSummary.isActiveToday,
+    streak_last_length: streakSummary.lastStreakLength,
+    streak_last_active_day: streakSummary.lastActiveDayKey,
+    streak_last_start_day: streakSummary.lastStreakStartDayKey,
+    streak_last_end_day: streakSummary.lastStreakEndDayKey,
+    streak_reset_day: streakSummary.resetDayKey,
   };
 }
 
@@ -532,6 +647,7 @@ exports.updateMyProfile = async (req, res) => {
     const inputDisplayName = typeof req.body?.display_name === 'string' ? req.body.display_name.trim() : '';
     const inputUsername = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
     const inputBio = typeof req.body?.bio === 'string' ? req.body.bio.trim() : '';
+    const inputAvatarUrl = typeof req.body?.avatar_url === 'string' ? req.body.avatar_url.trim() : '';
     const inputPreferredGenres = req.body?.preferred_genres;
 
     if (inputName || inputDisplayName) {
@@ -539,6 +655,9 @@ exports.updateMyProfile = async (req, res) => {
     }
     if (typeof req.body?.bio === 'string') {
       updates.bio = inputBio;
+    }
+    if (typeof req.body?.avatar_url === 'string') {
+      updates.avatar_url = inputAvatarUrl || null;
     }
 
     if (typeof req.body?.username === 'string') {
@@ -664,6 +783,42 @@ exports.followUser = async (req, res) => {
         'INSERT INTO follows (follower_id, following_id, created_at) VALUES ($1, $2, CURRENT_TIMESTAMP)',
         [actorUserId, targetUserId]
       );
+
+      try {
+        const actor = await getUserDisplaySummary(actorUserId);
+        const body = `${actor.name} mulai mengikuti aktivitas membacamu di Pustara.`;
+
+        await insertNotification({
+          userId: targetUserId,
+          type: 'follow',
+          title: 'Pengikut Baru',
+          body,
+          actorId: actorUserId,
+          data: {
+            follower_id: actorUserId,
+            follower_username: actor.username,
+          },
+        });
+
+        const contact = await getUserContact(targetUserId);
+        if (contact?.email) {
+          await sendEmail({
+            to: contact.email,
+            subject: 'Pustara - Ada Pengikut Baru',
+            text: [
+              `Halo ${contact.name || 'Pustara Reader'},`,
+              '',
+              body,
+              '',
+              'Buka Pustara untuk melihat profil dan aktivitas terbaru.',
+            ].join('\n'),
+          }).catch((mailError) => {
+            console.warn('Follow email warning:', mailError.message);
+          });
+        }
+      } catch (notifyError) {
+        console.warn('Follow notification warning:', notifyError.message);
+      }
     }
 
     const [followersCount, followingCount] = await Promise.all([
