@@ -50,6 +50,52 @@ function formatBookSummary(row) {
   };
 }
 
+function buildGenreStats(rows, limit = 5) {
+  const genreCounts = new Map();
+  let totalGenreOccurrences = 0;
+
+  for (const row of rows) {
+    const genres = parseStringArray(row.genres);
+    for (const genre of genres) {
+      totalGenreOccurrences += 1;
+      genreCounts.set(genre, (genreCounts.get(genre) || 0) + 1);
+    }
+  }
+
+  const topGenres = Array.from(genreCounts.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'id'))
+    .slice(0, limit)
+    .map(([genre, count]) => ({
+      genre,
+      count: Number(count || 0),
+    }));
+
+  if (topGenres.length === 0) {
+    return [];
+  }
+
+  const total = topGenres.reduce((sum, item) => sum + item.count, 0) || 1;
+  const ranked = topGenres.map((item) => {
+    const exact = (item.count / total) * 100;
+    const base = Math.floor(exact);
+    return {
+      ...item,
+      pct: base,
+      remainder: exact - base,
+    };
+  });
+
+  let remaining = 100 - ranked.reduce((sum, item) => sum + item.pct, 0);
+  const order = [...ranked].sort((a, b) => b.remainder - a.remainder || b.count - a.count || a.genre.localeCompare(b.genre, 'id'));
+
+  for (let index = 0; index < remaining; index += 1) {
+    const target = order[index % order.length];
+    target.pct += 1;
+  }
+
+  return ranked.map(({ genre, count, pct }) => ({ genre, count, pct }));
+}
+
 function toNonEmptyString(value) {
   if (value === null || value === undefined) return null;
   const text = String(value).trim();
@@ -400,6 +446,8 @@ async function buildUserProfile(targetUserId, actorId = null) {
   let currentlyReading = [];
   let likedBooks = [];
   let finishedCount = 0;
+  let reviewsWritten = 0;
+  let favoriteGenres = [];
   let computedStreak = 0;
   let streakSummary = {
     currentStreak: 0,
@@ -460,19 +508,51 @@ async function buildUserProfile(targetUserId, actorId = null) {
   try {
     const finishedRows = toRows(
       await db.executeQuery(
-        `SELECT COUNT(*) AS total
-         FROM reading_sessions
-         WHERE user_id = $1
+        `SELECT b.genres
+         FROM reading_sessions rs
+         JOIN books b ON b.id = rs.book_id
+         WHERE rs.user_id = $1
            AND (
-             COALESCE(progress_percentage, 0) >= 100
-             OR COALESCE(current_page, 0) >= COALESCE(total_pages, 0)
-           )`,
+             COALESCE(rs.progress_percentage, 0) >= 100
+             OR COALESCE(rs.current_page, 0) >= COALESCE(rs.total_pages, 0)
+           )
+           AND b.is_active = true`,
         [targetUserId]
       )
     );
-    finishedCount = Number(finishedRows[0]?.total || 0);
+    finishedCount = Number(finishedRows.length || 0);
   } catch (_) {
     finishedCount = 0;
+  }
+
+  try {
+    const borrowedGenreRows = toRows(
+      await db.executeQuery(
+        `SELECT b.genres
+         FROM loans l
+         JOIN books b ON b.id = l.book_id
+         WHERE l.user_id = $1
+           AND b.is_active = true`,
+        [targetUserId]
+      )
+    );
+    favoriteGenres = buildGenreStats(borrowedGenreRows, 5);
+  } catch (_) {
+    favoriteGenres = [];
+  }
+
+  try {
+    const reviewRows = toRows(
+      await db.executeQuery(
+        `SELECT COUNT(*) AS total
+         FROM reviews
+         WHERE user_id = $1`,
+        [targetUserId]
+      )
+    );
+    reviewsWritten = Number(reviewRows[0]?.total || 0);
+  } catch (_) {
+    reviewsWritten = 0;
   }
 
   try {
@@ -526,6 +606,13 @@ async function buildUserProfile(targetUserId, actorId = null) {
     is_following: isFollowing,
     currently_reading: currentlyReading,
     liked_books: likedBooks,
+    stats: {
+      total_read: resolvedTotalRead,
+      reading_streak: resolvedStreak,
+      borrowed_books: Number(currentlyReading.length || 0),
+      reviews_written: reviewsWritten,
+      favorite_genres: favoriteGenres,
+    },
     streak_is_active: streakSummary.isActiveToday,
     streak_last_length: streakSummary.lastStreakLength,
     streak_last_active_day: streakSummary.lastActiveDayKey,
@@ -949,6 +1036,56 @@ exports.getRecommendedUsers = async (req, res) => {
     });
   } catch (error) {
     console.error('Error fetching recommended users:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.searchUsers = async (req, res) => {
+  try {
+    const actorId = await resolveActorUserId(req);
+    const query = String(req.query.q || req.query.query || '').trim();
+    const limit = Math.min(Math.max(Number.parseInt(String(req.query.limit || 12), 10) || 12, 1), 20);
+
+    if (!query) {
+      return res.json({
+        success: true,
+        data: [],
+        meta: { total: 0, limit, query },
+      });
+    }
+
+    const rows = toRows(
+      await db.executeQuery(
+        `SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.preferred_genres,
+                u.total_read, u.reading_streak,
+                (SELECT COUNT(*) FROM follows f WHERE f.following_id = u.id) AS followers_count,
+                ${actorId ? `EXISTS(
+                  SELECT 1
+                  FROM follows f2
+                  WHERE f2.follower_id = $2
+                    AND f2.following_id = u.id
+                )` : 'false'} AS is_following
+         FROM users u
+         WHERE (${actorId ? 'u.id <> $2 AND' : ''} (
+           u.username ILIKE $1
+           OR COALESCE(u.display_name, '') ILIKE $1
+           OR COALESCE(u.bio, '') ILIKE $1
+         ))
+         ORDER BY followers_count DESC, u.total_read DESC, u.created_at DESC
+         LIMIT $${actorId ? 3 : 2}`,
+        actorId ? [`%${query}%`, actorId, limit] : [`%${query}%`, limit]
+      )
+    );
+
+    const data = rows.map((user) => mapUserCard(user, Boolean(user.is_following)));
+
+    res.json({
+      success: true,
+      data,
+      meta: { total: data.length, limit, query },
+    });
+  } catch (error) {
+    console.error('Error searching users:', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 };

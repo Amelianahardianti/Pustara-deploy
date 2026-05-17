@@ -6,6 +6,7 @@
 const express = require('express');
 const { pushActivity, getUserRecentBooks } = require('../services/redis');
 const UserSurveyService = require('../services/userSurveyService');
+const db = require('../config/database');
 
 const TRENDING_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const TRENDING_RESPONSE_CACHE = new Map();
@@ -229,12 +230,50 @@ async function getUserSurveyContext(uid) {
 
       genresArray = genresArray.filter((genre) => genre && genre !== '__SKIPPED__');
 
-      return {
+      const surveyResult = {
         user_gender:      result.data.gender || null, // "L", "P", "X"
         user_age:         result.data.age ? String(result.data.age) : null,
         user_age_group:   ageGroup,
         preferred_genres: genresArray.length > 0 ? genresArray : null,
       };
+
+      // Enhance with chat history genres if survey genres are missing
+      if (!surveyResult.preferred_genres || surveyResult.preferred_genres.length === 0) {
+        try {
+          const chatGenres = await db.executeQuery(
+            `SELECT detected_genre FROM chat_analytics
+             WHERE user_id = $1 AND detected_genre IS NOT NULL
+             ORDER BY ts DESC
+             LIMIT 20`,
+            [uid]
+          );
+
+          const rows = Array.isArray(chatGenres) ? chatGenres : 
+                       (chatGenres && Array.isArray(chatGenres.rows)) ? chatGenres.rows :
+                       (chatGenres && Array.isArray(chatGenres.recordset)) ? chatGenres.recordset : [];
+
+          if (rows.length > 0) {
+            const genreCount = {};
+            rows.forEach(({ detected_genre }) => {
+              if (detected_genre) {
+                genreCount[detected_genre] = (genreCount[detected_genre] || 0) + 1;
+              }
+            });
+            const topChatGenres = Object.entries(genreCount)
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 3)
+              .map(([g]) => g);
+
+            if (topChatGenres.length > 0) {
+              surveyResult.preferred_genres = topChatGenres;
+            }
+          }
+        } catch (e) {
+          console.warn('[ChatAnalytics] Failed to fetch user genre history:', e.message);
+        }
+      }
+
+      return surveyResult;
     }
   } catch (e) {
     console.warn('[Survey] Failed to fetch user survey:', e.message);
