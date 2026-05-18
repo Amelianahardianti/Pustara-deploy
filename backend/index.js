@@ -37,7 +37,7 @@ const { createVerifyTokenMiddleware, createOptionalVerifyTokenMiddleware } = req
 const { authorizeAdmin } = require("./middleware/adminAuth");
 const { createAuthRoutes } = require("./routes/auth");
 const createSurveyRoutes = require("./routes/survey");
-const { initializeDatabase, ensureNeonShelfSchemaCompatibility, createLoginEventsTable, createUsersTable, createUserSurveyTable } = require("./config/database");
+const { initializeDatabase, ensureNeonShelfSchemaCompatibility, ensureNeonUsersSchemaCompatibility, createLoginEventsTable, createUsersTable, createUserSurveyTable } = require("./config/database");
 
 // Routes
 const createRecommendationsRoutes = require('./routes/recommendations');
@@ -176,6 +176,11 @@ async function startServer() {
       await ensureNeonShelfSchemaCompatibility();
     } catch (schemaError) {
       console.warn(`⚠️  Shelf schema compatibility check skipped: ${schemaError.message}`);
+    }
+    try {
+      await ensureNeonUsersSchemaCompatibility();
+    } catch (schemaError) {
+      console.warn(`⚠️  Users schema compatibility check skipped: ${schemaError.message}`);
     }
     try {
       await createLoginEventsTable();
