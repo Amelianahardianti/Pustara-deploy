@@ -983,7 +983,7 @@ exports.unfollowUser = async (req, res) => {
 exports.getRecommendedUsers = async (req, res) => {
   try {
     const actorId = await resolveActorUserId(req);
-    const limit = Math.min(Math.max(Number.parseInt(String(req.query.limit || 8), 10) || 8, 5), 10);
+    const limit = Math.min(Math.max(Number.parseInt(String(req.query.limit || 8), 10) || 8, 1), 20);
 
     const params = [];
     let whereClause = '';

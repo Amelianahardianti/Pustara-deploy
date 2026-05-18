@@ -16,9 +16,18 @@ async function initNeon() {
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.NODE_ENV === 'dummy' ? false : { rejectUnauthorized: false },
   });
+
+  // Force every connection to use the public schema.
+  // Neon sometimes resets the default search_path, causing "relation does not exist".
+  pgPool.on('connect', (client) => {
+    client.query('SET search_path TO public').catch((err) => {
+      console.warn('[DB] Failed to set search_path:', err.message);
+    });
+  });
   
   // Test connection
   const client = await pgPool.connect();
+  await client.query('SET search_path TO public');
   client.release();
   console.log('✅ Neon PostgreSQL connected (Production Cloud)');
   return pgPool;

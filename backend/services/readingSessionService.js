@@ -47,8 +47,10 @@ exports.updateReadingProgress = async (userId, bookId, currentPage, readingTimeM
 
     // Check if session exists (only non-finished ones — finished sessions are riwayat and must be preserved)
     const existingResult = await pool.query(
-      `SELECT id, reading_time_minutes FROM reading_sessions 
-       WHERE user_id = $1 AND book_id = $2 AND status != 'finished'`,
+      `SELECT id, current_page, total_pages, progress_percentage, reading_time_minutes FROM reading_sessions 
+       WHERE user_id = $1 AND book_id = $2 AND status != 'finished'
+       ORDER BY started_at DESC
+       LIMIT 1`,
       [userId, bookId]
     );
 

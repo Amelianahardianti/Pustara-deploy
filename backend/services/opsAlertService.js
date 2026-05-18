@@ -1,4 +1,4 @@
-const nodemailer = require('nodemailer');
+const { sendEmail } = require('./emailService');
 
 function isEnabled() {
   return String(process.env.ALERT_EMAIL_ENABLED || '').toLowerCase() === 'true';
@@ -10,18 +10,6 @@ function getRecipients() {
     .split(',')
     .map((v) => v.trim())
     .filter(Boolean);
-}
-
-function createTransport() {
-  return nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true',
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
-    },
-  });
 }
 
 async function sendOpsAlert(subject, details = []) {
@@ -41,13 +29,15 @@ async function sendOpsAlert(subject, details = []) {
     ...lines,
   ].join('\n');
 
-  const transporter = createTransport();
-  await transporter.sendMail({
-    from: process.env.ALERT_EMAIL_FROM || process.env.SMTP_USER,
+  const sendResult = await sendEmail({
     to: recipients.join(', '),
     subject,
     text,
   });
+
+  if (!sendResult?.sent) {
+    return { sent: false, reason: sendResult?.reason || 'failed to send email' };
+  }
 
   return { sent: true, recipients: recipients.length };
 }

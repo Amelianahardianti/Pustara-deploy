@@ -15,7 +15,9 @@ const booksController = require('../controllers/booksController');
 router.get('/', booksController.getBooksAdmin);
 router.post('/', booksController.createBook);
 router.get('/without-file', booksController.getBooksWithoutFile);
+router.get('/:id/file', booksController.downloadBookFileAdmin);
 router.put('/top-picks', booksController.setTopPicks);
 router.put('/:id', booksController.updateBook);
+router.delete('/:id/permanent', booksController.deleteBookPermanent);
 
 module.exports = router;
