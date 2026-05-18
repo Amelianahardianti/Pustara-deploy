@@ -629,7 +629,25 @@ exports.getBookDetail = async (req, res) => {
       });
     }
 
-    const query = 'SELECT * FROM books WHERE id = $1 AND is_active = true';
+    const query = `
+      SELECT
+        b.*,
+        COALESCE(review_stats.review_avg_rating, 0) AS review_avg_rating,
+        COALESCE(review_stats.review_rating_count, 0) AS review_rating_count,
+        COALESCE(review_stats.review_count, 0) AS review_count
+      FROM books b
+      LEFT JOIN (
+        SELECT
+          book_id,
+          COUNT(*) AS review_count,
+          SUM(CASE WHEN rating IS NOT NULL THEN 1 ELSE 0 END) AS review_rating_count,
+          ROUND(COALESCE(AVG(CAST(rating AS DECIMAL(10, 2))), 0), 2) AS review_avg_rating
+        FROM reviews
+        GROUP BY book_id
+      ) review_stats ON review_stats.book_id = b.id
+      WHERE b.id = $1 AND b.is_active = true
+      LIMIT 1
+    `;
     const result = await db.executeQuery(query, [id]);
     const rows = toRows(result);
 
@@ -644,7 +662,17 @@ exports.getBookDetail = async (req, res) => {
       });
     }
 
-    const book = withDownloadUrl(rows[0], req);
+    const rawBook = rows[0];
+    const normalizedBook = {
+      ...rawBook,
+      avg_rating: Number(rawBook.review_rating_count || 0) > 0
+        ? Number(rawBook.review_avg_rating || 0)
+        : 0,
+      rating_count: Number(rawBook.review_rating_count || 0),
+      review_count: Number(rawBook.review_count || 0),
+    };
+
+    const book = withDownloadUrl(normalizedBook, req);
 
     res.json({
       success: true,

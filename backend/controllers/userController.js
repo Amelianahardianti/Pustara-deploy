@@ -506,21 +506,59 @@ async function buildUserProfile(targetUserId, actorId = null) {
   }
 
   try {
-    const finishedRows = toRows(
+    // Count finished history items using the same logic as /shelf/me
+    const finishedCountRows = toRows(
       await db.executeQuery(
-        `SELECT b.genres
-         FROM reading_sessions rs
-         JOIN books b ON b.id = rs.book_id
-         WHERE rs.user_id = $1
-           AND (
-             COALESCE(rs.progress_percentage, 0) >= 100
-             OR COALESCE(rs.current_page, 0) >= COALESCE(rs.total_pages, 0)
-           )
-           AND b.is_active = true`,
+        `SELECT COUNT(*) AS total FROM (
+           -- returned loans
+           SELECT
+             b.id,
+             CASE
+               WHEN rs.id IS NULL THEN 'unfinished'
+               WHEN COALESCE(rs.progress_percentage, 0) >= 100
+                 OR COALESCE(rs.current_page, 0) >= COALESCE(rs.total_pages, 0) THEN 'finished'
+               ELSE 'unfinished'
+             END AS history_status
+           FROM loans l
+           JOIN books b ON b.id = l.book_id
+           LEFT JOIN LATERAL (
+             SELECT id, current_page, total_pages, progress_percentage, finished_at, started_at, reading_time_minutes
+             FROM reading_sessions
+             WHERE book_id = l.book_id AND user_id = l.user_id
+             ORDER BY COALESCE(finished_at, last_read_at, started_at) DESC
+             LIMIT 1
+           ) rs ON true
+           WHERE l.user_id = $1
+             AND b.is_active = true
+             AND l.returned_at IS NOT NULL
+
+           UNION ALL
+
+           -- finished reading sessions that are not tied to a returned loan
+           SELECT
+             b.id,
+             CASE
+               WHEN COALESCE(rs.progress_percentage, 0) < 100
+                OR COALESCE(rs.current_page, 0) < COALESCE(rs.total_pages, 0) THEN 'unfinished'
+               ELSE 'finished'
+             END AS history_status
+           FROM reading_sessions rs
+           JOIN books b ON b.id = rs.book_id
+           WHERE rs.user_id = $1
+             AND b.is_active = true
+             AND rs.status = 'finished'
+             AND NOT EXISTS (
+               SELECT 1
+               FROM loans l
+               WHERE l.book_id = rs.book_id
+                 AND l.user_id = rs.user_id
+                 AND l.returned_at IS NOT NULL
+             )
+         ) sub WHERE history_status = 'finished'`,
         [targetUserId]
       )
     );
-    finishedCount = Number(finishedRows.length || 0);
+    finishedCount = Number(finishedCountRows[0]?.total ?? 0);
   } catch (_) {
     finishedCount = 0;
   }
@@ -539,6 +577,25 @@ async function buildUserProfile(targetUserId, actorId = null) {
     favoriteGenres = buildGenreStats(borrowedGenreRows, 5);
   } catch (_) {
     favoriteGenres = [];
+  }
+
+  let activeBorrowedCount = 0;
+  try {
+    const activeBorrowedRows = toRows(
+      await db.executeQuery(
+        `SELECT COUNT(DISTINCT b.id) AS total
+         FROM loans l
+         JOIN books b ON b.id = l.book_id
+         WHERE l.user_id = $1
+           AND b.is_active = true
+           AND l.returned_at IS NULL
+           AND l.status IN ('active', 'extended')`,
+        [targetUserId]
+      )
+    );
+    activeBorrowedCount = Number(activeBorrowedRows[0]?.total ?? 0);
+  } catch (_) {
+    activeBorrowedCount = 0;
   }
 
   try {
@@ -609,7 +666,6 @@ async function buildUserProfile(targetUserId, actorId = null) {
     stats: {
       total_read: resolvedTotalRead,
       reading_streak: resolvedStreak,
-      borrowed_books: Number(currentlyReading.length || 0),
       reviews_written: reviewsWritten,
       favorite_genres: favoriteGenres,
     },

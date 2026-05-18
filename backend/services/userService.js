@@ -136,13 +136,57 @@ class UserService {
 
       const col = isNeon ? 'firebase_uid' : 'uid';
       const rows = await executeQuery(
-        `UPDATE ${isNeon ? 'users' : 'Users'} SET role = $1 WHERE ${col} = $2; SELECT * FROM ${isNeon ? 'users' : 'Users'} WHERE ${col} = $2;`,
+        isNeon
+          ? `UPDATE users SET role = $1, updated_at = NOW() WHERE ${col} = $2 RETURNING *`
+          : `UPDATE Users SET role = $1, updated_at = GETDATE() WHERE ${col} = $2; SELECT * FROM Users WHERE ${col} = $2;`,
         [role, uid]
       );
-      
-      return { success: true, data: rows[rows.length - 1] };
+
+      return { success: true, data: rows[rows.length - 1] || rows[0] || null };
     } catch (error) {
       console.error('updateUserRole error:', error.message);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Update user status (admin only)
+   */
+  static async updateUserStatus(uid, status) {
+    try {
+      if (!['active', 'suspended'].includes(status)) {
+        return { success: false, error: 'Invalid status' };
+      }
+
+      const col = isNeon ? 'firebase_uid' : 'uid';
+      const rows = await executeQuery(
+        isNeon
+          ? `UPDATE users SET status = $1, updated_at = NOW() WHERE ${col} = $2 RETURNING *`
+          : `UPDATE Users SET status = $1, updated_at = GETDATE() WHERE ${col} = $2; SELECT * FROM Users WHERE ${col} = $2;`,
+        [status, uid]
+      );
+
+      return { success: true, data: rows[rows.length - 1] || rows[0] || null };
+    } catch (error) {
+      console.error('updateUserStatus error:', error.message);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Delete user from database by Firebase UID
+   */
+  static async deleteUserByUid(uid) {
+    try {
+      const col = isNeon ? 'firebase_uid' : 'uid';
+      const rows = await executeQuery(
+        `DELETE FROM ${isNeon ? 'users' : 'Users'} WHERE ${col} = $1 RETURNING *`,
+        [uid]
+      );
+
+      return { success: true, data: rows[0] || null };
+    } catch (error) {
+      console.error('deleteUserByUid error:', error.message);
       return { success: false, error: error.message };
     }
   }
@@ -152,11 +196,39 @@ class UserService {
    */
   static async getAllUsers(limit = 100, offset = 0) {
     try {
+      const tableName = isNeon ? 'users' : 'Users';
       const rows = await executeQuery(
-        `SELECT id, uid, email, display_name as displayName, role, createdAt FROM ${isNeon ? 'users' : 'Users'} ORDER BY createdAt DESC LIMIT $1 OFFSET $2`,
+        isNeon
+          ? `SELECT
+              id,
+              firebase_uid AS uid,
+              email,
+              username,
+              display_name AS "displayName",
+              avatar_url AS "avatarUrl",
+              role,
+              COALESCE(status, 'active') AS status,
+              COALESCE(total_read, 0) AS "totalRead",
+              created_at AS "createdAt"
+            FROM users
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2`
+          : `SELECT
+              id,
+              uid,
+              email,
+              displayName,
+              photoURL AS avatarUrl,
+              role,
+              COALESCE(status, 'active') AS status,
+              COALESCE(total_read, 0) AS totalRead,
+              createdAt
+            FROM Users
+            ORDER BY createdAt DESC
+            OFFSET $2 ROWS FETCH NEXT $1 ROWS ONLY`,
         [limit, offset]
       );
-      const countResult = await executeQuery(`SELECT COUNT(*) as total FROM ${isNeon ? 'users' : 'Users'}`);
+      const countResult = await executeQuery(`SELECT COUNT(*) as total FROM ${tableName}`);
       const total = countResult[0]?.total || 0;
       
       return { success: true, data: rows, total };
