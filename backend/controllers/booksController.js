@@ -865,7 +865,7 @@ exports.getBookDetail = async (req, res) => {
 
     const queueCount = await getQueueCountByBookId(id);
     const book = {
-      ...withDownloadUrl(rows[0], req),
+      ...withDownloadUrl(normalizedBook, req),
       queue: queueCount,
     };
 
