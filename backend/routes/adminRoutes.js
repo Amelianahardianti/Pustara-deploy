@@ -287,7 +287,7 @@ router.get('/loans', asyncHandler(async (req, res) => {
   const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
   const countQuery = `
-    SELECT COUNT(*) AS total
+    SELECT COUNT(DISTINCT l.id) AS total
     FROM loans l
     JOIN books b ON b.id = l.book_id
     JOIN users u ON u.id = l.user_id
@@ -297,7 +297,17 @@ router.get('/loans', asyncHandler(async (req, res) => {
   params.push(limit, offset);
 
   const dataQuery = `
-    SELECT
+    WITH latest_sessions AS (
+      SELECT DISTINCT ON (user_id, book_id)
+        user_id,
+        book_id,
+        progress_percentage,
+        current_page,
+        total_pages
+      FROM reading_sessions
+      ORDER BY user_id, book_id, COALESCE(last_read_at, finished_at, started_at) DESC NULLS LAST, id DESC
+    )
+    SELECT DISTINCT ON (l.id)
       l.id             AS loan_id,
       l.borrowed_at,
       COALESCE(l.due_date, l.due_at) AS due_at,
@@ -328,9 +338,9 @@ router.get('/loans', asyncHandler(async (req, res) => {
     FROM loans l
     JOIN books b ON b.id = l.book_id
     JOIN users u ON u.id = l.user_id
-    LEFT JOIN reading_sessions rs ON rs.user_id = l.user_id AND rs.book_id = l.book_id
+    LEFT JOIN latest_sessions rs ON rs.user_id = l.user_id AND rs.book_id = l.book_id
     ${whereClause}
-    ORDER BY l.borrowed_at DESC
+    ORDER BY l.id, l.borrowed_at DESC
     LIMIT $${params.length - 1} OFFSET $${params.length}
   `;
 
@@ -374,7 +384,17 @@ router.get('/loans/stats', asyncHandler(async (_req, res) => {
 router.get('/loans/by-book/:bookId', asyncHandler(async (req, res) => {
   const { bookId } = req.params;
   const result = await db.executeQuery(`
-    SELECT
+    WITH latest_sessions AS (
+      SELECT DISTINCT ON (user_id, book_id)
+        user_id,
+        book_id,
+        progress_percentage,
+        current_page,
+        total_pages
+      FROM reading_sessions
+      ORDER BY user_id, book_id, COALESCE(last_read_at, finished_at, started_at) DESC NULLS LAST, id DESC
+    )
+    SELECT DISTINCT ON (l.id)
       l.id AS loan_id,
       l.borrowed_at,
       COALESCE(l.due_date, l.due_at) AS due_at,
@@ -398,9 +418,9 @@ router.get('/loans/by-book/:bookId', asyncHandler(async (req, res) => {
       rs.total_pages
     FROM loans l
     JOIN users u ON u.id = l.user_id
-    LEFT JOIN reading_sessions rs ON rs.user_id = l.user_id AND rs.book_id = l.book_id
+    LEFT JOIN latest_sessions rs ON rs.user_id = l.user_id AND rs.book_id = l.book_id
     WHERE l.book_id = $1
-    ORDER BY l.borrowed_at DESC
+    ORDER BY l.id, l.borrowed_at DESC
   `, [bookId]);
 
   res.json({ success: true, data: toRows(result) });

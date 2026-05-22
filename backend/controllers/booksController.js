@@ -292,110 +292,135 @@ async function resolveActiveLoanAccess(firebaseUid, bookId) {
   };
 }
 
-// GET /books/:id/reviews - Get book reviews
+// // GET /books/:id/reviews - Get book reviews
 exports.getBookReviews = async (req, res) => {
+  let phase = 'init';
   try {
+    phase = 'parse_request';
     const { id } = req.params;
     const { limit = 100, offset = 0 } = req.query;
-    const limitNum = sanitizePagination(limit, 100, 1, 500);
-    const offsetNum = sanitizePagination(offset, 0, 0, 100000);
+    
+    // FIX 1: Inline sanitizePagination biar ga "not defined"
+    const limitParsed = parseInt(limit, 10);
+    const limitNum = !isNaN(limitParsed) ? Math.min(Math.max(limitParsed, 1), 500) : 100;
+    
+    const offsetParsed = parseInt(offset, 10);
+    const offsetNum = !isNaN(offsetParsed) ? Math.max(offsetParsed, 0) : 0;
 
     console.log('[BookReviews] Request received:', { id, limitQuery: limit, offsetQuery: offset, limitNum, offsetNum });
 
-    if (!isUuidLike(id)) {
-      console.log('[BookReviews] INVALID UUID:', id);
+    // FIX 2: Inline UUID validation biar ga "isUuidLike is not defined"
+    const cleanId = String(id || '').trim();
+    const isValidUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(cleanId);
+    
+    if (!isValidUuid) {
+      console.log('[BookReviews] INVALID UUID:', cleanId);
       return res.status(400).json({
         success: false,
         message: 'Invalid book id format',
-        error: { code: 'INVALID_BOOK_ID', id },
+        error: { code: 'INVALID_BOOK_ID', id: cleanId },
       });
     }
 
-    // Verify book exists
+    // Verify book exists (FIX: Pakai CAST AS TEXT biar 100% jalan)
+    phase = 'book_check';
     const bookCheck = await db.executeQuery(
-      'SELECT id FROM books WHERE id = $1 AND is_active = true',
-      [id]
+      'SELECT id FROM books WHERE CAST(id AS TEXT) = CAST($1 AS TEXT) AND is_active = true',
+      [cleanId]
     );
 
     const bookRows = toRows(bookCheck);
 
     if (bookRows.length === 0) {
-      console.log('[BookReviews] BOOK NOT FOUND:', id);
+      console.log('[BookReviews] BOOK NOT FOUND:', cleanId);
       return res.status(404).json({
         success: false,
         message: 'Book not found',
-        error: { code: 'BOOK_NOT_FOUND', id },
+        error: { code: 'BOOK_NOT_FOUND', id: cleanId },
       });
     }
-    console.log('[BookReviews] Book found:', id);
+    console.log('[BookReviews] Book found:', cleanId);
 
-    // Get authenticated user's ID (optional - for privacy check)
-    let viewingUserId = null;
+    // Get authenticated user's ID
+    // FIX 3: Jangan passing `null` murni karena bikin driver DB meledak waktu nge-parse $4. Pakai dummy UUID.
+    let viewingUserId = '00000000-0000-0000-0000-000000000000';
     if (req.user?.uid) {
       try {
+        phase = 'viewer_lookup';
         const userRows = toRows(
           await db.executeQuery(
             'SELECT id FROM users WHERE firebase_uid = $1 LIMIT 1',
             [req.user.uid]
           )
         );
-        viewingUserId = userRows[0]?.id || null;
+        if (userRows[0]?.id) viewingUserId = userRows[0].id;
       } catch (_) {
-        // If lookup fails, just continue without viewing_user_id
+        // If lookup fails, just continue
       }
     }
 
     // Fetch reviews with user info
-    // Privacy: Only show reviews where public_reviews=true OR the viewing user is the owner
-    // Table uses 'body' column for review text; alias as both 'body' and 'review_text' for compatibility
+    // FIX 4: Ganti syntax ::int dan $4 IS NULL yang rawan crash
     const query = `
       SELECT
         r.id,
         r.user_id,
         r.book_id,
         r.rating,
-        r.body as text,
-        r.body as body,
-        r.body as review_text,
+        r.review_text as text,
+        r.review_text as body,
+        r.review_text as review_text,
         r.created_at as time,
         COALESCE(u.display_name, u.username) as name,
         u.avatar_url,
         COALESCE(u.display_name, u.username, 'U') as avatar,
-        COALESCE(r.likes, 0) as likes
+        (SELECT CAST(COUNT(*) AS INT) FROM review_likes rl2 WHERE CAST(rl2.review_id AS TEXT) = CAST(r.id AS TEXT)) as likes,
+        u.firebase_uid as firebase_uid,
+        (CAST(r.user_id AS TEXT) = CAST($4 AS TEXT)) as is_owner,
+        CASE
+          WHEN CAST($4 AS TEXT) = '00000000-0000-0000-0000-000000000000' THEN FALSE
+          ELSE EXISTS (
+            SELECT 1
+            FROM review_likes rl
+            WHERE CAST(rl.review_id AS TEXT) = CAST(r.id AS TEXT)
+              AND CAST(rl.user_id AS TEXT) = CAST($4 AS TEXT)
+          )
+        END as liked
       FROM reviews r
-      LEFT JOIN users u ON r.user_id = u.id
-      WHERE r.book_id = $1
+      LEFT JOIN users u ON CAST(r.user_id AS TEXT) = CAST(u.id AS TEXT)
+      WHERE CAST(r.book_id AS TEXT) = CAST($1 AS TEXT)
         AND (
           COALESCE(u.public_reviews, true) = true
-          OR r.user_id = $4
+          OR CAST(r.user_id AS TEXT) = CAST($4 AS TEXT)
         )
       ORDER BY r.created_at DESC
       LIMIT $2 OFFSET $3
     `;
 
-    console.log('[BookReviews] Query:', { bookId: id, limit: limitNum, offset: offsetNum, viewingUserId });
-    const result = await db.executeQuery(query, [id, limitNum, offsetNum, viewingUserId]);
+    console.log('[BookReviews] Query:', { bookId: cleanId, limit: limitNum, offset: offsetNum, viewingUserId });
+    phase = 'reviews_list_query';
+    const result = await db.executeQuery(query, [cleanId, limitNum, offsetNum, viewingUserId]);
     const reviews = toRows(result);
-    console.log('[BookReviews] Fetched reviews:', reviews.length, 'for book', id);
+    
+    console.log('[BookReviews] Fetched reviews:', reviews.length, 'for book', cleanId);
     if (reviews.length > 0) {
       console.log('[BookReviews] First review sample:', { id: reviews[0]?.id, rating: reviews[0]?.rating, textLen: String(reviews[0]?.text || '').length });
     } else {
-      console.log('[BookReviews] NO REVIEWS FOUND for book:', id);
+      console.log('[BookReviews] NO REVIEWS FOUND for book:', cleanId);
     }
 
-    // Get total count (respecting privacy)
+    // Get total count
+    phase = 'reviews_count_query';
     const countResult = await db.executeQuery(
-      `SELECT COUNT(*) as total FROM reviews r
-       LEFT JOIN users u ON r.user_id = u.id
-       WHERE r.book_id = $1
-         AND (COALESCE(u.public_reviews, true) = true OR r.user_id = $2)`,
-      [id, viewingUserId]
+      `SELECT CAST(COUNT(*) AS INT) as total FROM reviews r
+       LEFT JOIN users u ON CAST(r.user_id AS TEXT) = CAST(u.id AS TEXT)
+       WHERE CAST(r.book_id AS TEXT) = CAST($1 AS TEXT)
+         AND (COALESCE(u.public_reviews, true) = true OR CAST(r.user_id AS TEXT) = CAST($2 AS TEXT))`,
+      [cleanId, viewingUserId]
     );
 
     const countRows = toRows(countResult);
-
-    const totalReviews =
-      Number.parseInt(String(countRows[0]?.total || 0), 10) || 0;
+    const totalReviews = Number.parseInt(String(countRows[0]?.total || 0), 10) || 0;
 
     const responsePayload = {
       success: true,
@@ -416,11 +441,15 @@ exports.getBookReviews = async (req, res) => {
 
     res.json(responsePayload);
   } catch (error) {
-    console.error('[BookReviews] EXCEPTION ERROR:', error.message, error.stack);
+    console.error('[BookReviews] EXCEPTION ERROR:', { phase, message: error.message, stack: error.stack });
 
     res.status(500).json({
       success: false,
       message: error.message,
+      error: {
+        code: 'BOOK_REVIEWS_QUERY_FAILED',
+        phase,
+      },
     });
   }
 };
@@ -486,7 +515,7 @@ exports.createOrUpdateReview = async (req, res) => {
 
     // Check if review exists
     const checkQuery =
-      'SELECT id FROM reviews WHERE book_id = $1 AND user_id = $2';
+      'SELECT id FROM reviews WHERE book_id::text = $1::text AND user_id = $2';
 
     const checkResult = await db.executeQuery(checkQuery, [
       book_id,
@@ -559,6 +588,100 @@ exports.createOrUpdateReview = async (req, res) => {
       success: false,
       message: error.message,
     });
+  }
+};
+
+// PUT /reviews/:id - Update a review (only owner)
+exports.updateReview = async (req, res) => {
+  try {
+    const reviewId = req.params.reviewId;
+    const { rating, body } = req.body;
+    const firebase_uid = req.user?.uid;
+    const { isNeon } = require('../config/database');
+
+    if (!firebase_uid) return res.status(401).json({ success: false, message: 'User not authenticated' });
+    if (!isUuidLike(reviewId)) return res.status(400).json({ success: false, message: 'Invalid review id' });
+
+    const userResult = await db.executeQuery('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
+    const userRows = toRows(userResult);
+    if (!userRows.length) return res.status(404).json({ success: false, message: 'User not found' });
+    const user_id = userRows[0].id;
+
+    const reviewRows = toRows(await db.executeQuery('SELECT id, user_id, book_id FROM reviews WHERE id = $1', [reviewId]));
+    if (!reviewRows.length) return res.status(404).json({ success: false, message: 'Review not found' });
+    if (String(reviewRows[0].user_id) !== String(user_id)) return res.status(403).json({ success: false, message: 'Forbidden' });
+
+    const sets = [];
+    const values = [];
+    let idx = 1;
+    if (typeof rating !== 'undefined' && rating !== null) {
+      sets.push(`rating = $${idx++}`);
+      values.push(rating);
+    }
+    if (typeof body !== 'undefined' && body !== null) {
+      const reviewColumn = isNeon ? 'review_text' : 'body';
+      sets.push(`${reviewColumn} = $${idx++}`);
+      values.push(body);
+    }
+
+    if (sets.length === 0) return res.status(400).json({ success: false, message: 'Nothing to update' });
+
+    // always update updated_at
+    sets.push('updated_at = NOW()');
+
+    values.push(reviewId);
+    values.push(user_id);
+
+    const query = `UPDATE reviews SET ${sets.join(', ')} WHERE id = $${values.length - 1} AND user_id = $${values.length} RETURNING id, rating, ${isNeon ? 'review_text as body' : 'body'}, created_at, updated_at, book_id`;
+
+    const result = await db.executeQuery(query, values);
+    const rows = toRows(result);
+    if (!rows.length) return res.status(500).json({ success: false, message: 'Failed to update review' });
+
+    const review = rows[0];
+
+    // Recalculate book aggregates
+    try {
+      await db.executeQuery(`UPDATE books SET avg_rating = (SELECT ROUND(AVG(rating)::numeric, 2) FROM reviews WHERE book_id::text = $1::text), rating_count = (SELECT COUNT(*) FROM reviews WHERE book_id::text = $1::text) WHERE id::text = $1::text`, [review.book_id]);
+    } catch (_) { /* ignore */ }
+
+    res.json({ success: true, data: { id: review.id, rating: review.rating, body: review.body, created_at: review.created_at, updated_at: review.updated_at } });
+  } catch (error) {
+    console.error('Error updating review:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// DELETE /reviews/:id - Delete a review (only owner)
+exports.deleteReview = async (req, res) => {
+  try {
+    const reviewId = req.params.reviewId;
+    const firebase_uid = req.user?.uid;
+
+    if (!firebase_uid) return res.status(401).json({ success: false, message: 'User not authenticated' });
+    if (!isUuidLike(reviewId)) return res.status(400).json({ success: false, message: 'Invalid review id' });
+
+    const userResult = await db.executeQuery('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
+    const userRows = toRows(userResult);
+    if (!userRows.length) return res.status(404).json({ success: false, message: 'User not found' });
+    const user_id = userRows[0].id;
+
+    const reviewRows = toRows(await db.executeQuery('SELECT id, user_id, book_id FROM reviews WHERE id = $1', [reviewId]));
+    if (!reviewRows.length) return res.status(404).json({ success: false, message: 'Review not found' });
+    if (String(reviewRows[0].user_id) !== String(user_id)) return res.status(403).json({ success: false, message: 'Forbidden' });
+
+    const bookId = reviewRows[0].book_id;
+
+    await db.executeQuery('DELETE FROM reviews WHERE id = $1', [reviewId]);
+
+    try {
+      await db.executeQuery(`UPDATE books SET avg_rating = (SELECT ROUND(AVG(rating)::numeric, 2) FROM reviews WHERE book_id::text = $1::text), rating_count = (SELECT COUNT(*) FROM reviews WHERE book_id::text = $1::text) WHERE id::text = $1::text`, [bookId]);
+    } catch (_) { /* ignore */ }
+
+    res.json({ success: true, message: 'Review deleted' });
+  } catch (error) {
+    console.error('Error deleting review:', error.message);
+    res.status(500).json({ success: false, message: error.message });
   }
 };
 

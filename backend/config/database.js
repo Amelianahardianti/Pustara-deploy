@@ -128,6 +128,11 @@ async function ensureNeonShelfSchemaCompatibility() {
       resolved_at TIMESTAMPTZ
     )`,
     `CREATE INDEX IF NOT EXISTS idx_review_reports_status ON review_reports(status)`,
+    "ALTER TABLE IF EXISTS reviews ADD COLUMN IF NOT EXISTS review_text TEXT",
+    "UPDATE reviews SET review_text = body WHERE review_text IS NULL AND body IS NOT NULL",
+    "ALTER TABLE IF EXISTS reviews ADD COLUMN IF NOT EXISTS body TEXT",
+    "UPDATE reviews SET body = review_text WHERE body IS NULL AND review_text IS NOT NULL",
+    "ALTER TABLE IF EXISTS reviews ADD COLUMN IF NOT EXISTS likes INTEGER DEFAULT 0",
   ];
 
   for (const statement of safeStatements) {

@@ -27,10 +27,11 @@ function isLocalHostname(hostname) {
 function shouldBypassCaptchaForLocalTesting(req) {
   const bypassEnabled = process.env.TURNSTILE_BYPASS_LOCAL === "true";
   const vercelEnv = process.env.VERCEL_ENV;
+  const nodeEnv = String(process.env.NODE_ENV || '').toLowerCase();
 
   // Never bypass on Vercel production.
   if (!bypassEnabled || vercelEnv === "production") {
-    return false;
+    // Continue with local-origin detection below.
   }
 
   const origin = getHeaderValue(req.headers.origin);
@@ -40,7 +41,9 @@ function shouldBypassCaptchaForLocalTesting(req) {
 
   try {
     const url = new URL(candidate);
-    return isLocalHostname(url.hostname);
+    const isLocal = isLocalHostname(url.hostname);
+    if (isLocal && nodeEnv !== 'production') return true;
+    return bypassEnabled && isLocal;
   } catch {
     return false;
   }

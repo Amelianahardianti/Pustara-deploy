@@ -119,8 +119,10 @@ function normalizeRecommendation(rec = {}) {
 }
 
 function normalizeRecommendationsPayload(result = {}) {
-  const recommendations = Array.isArray(result.recommendations)
-    ? result.recommendations.map(normalizeRecommendation)
+  // Support multiple possible keys from the AI service response
+  const raw = result.recommendations ?? result.items ?? result.results ?? result.data ?? [];
+  const recommendations = Array.isArray(raw)
+    ? raw.map(normalizeRecommendation)
     : [];
 
   return {
@@ -185,6 +187,12 @@ async function proxyToAI(method, path, body = null) {
   console.log(`[AI Proxy] ${method} → ${url}`);
   const response = await fetch(url, options);
   const data     = await response.json();
+
+  console.log(
+    '[AI Proxy] STATUS:', response.status,
+    '| KEYS:', Object.keys(data),
+    '| recs count:', data?.recommendations?.length ?? data?.items?.length ?? data?.results?.length ?? data?.data?.length ?? 'N/A'
+  );
 
   if (!response.ok) {
     const err = new Error(data.detail || `AI service error: ${response.status}`);

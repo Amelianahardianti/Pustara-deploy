@@ -59,17 +59,10 @@ require('./jobs/cron'); //init cron jobs for ai-related tasks
 // ==========================================
 const app = express();
 
-// CORS setup
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-  
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
-  next();
-});
+// NOTE: Use the `cors` middleware below to handle preflight and origin reflection.
+// Avoid setting Access-Control-Allow-* headers manually here because it may
+// conflict with `cors` and return a wildcard origin while also allowing
+// credentials, which browsers will reject during preflight.
 
 // Middleware
 app.use(express.json());
@@ -80,11 +73,36 @@ app.use(fileUpload({
   useTempFiles: true,
   tempFileDir: '/tmp/',
 }));
+// Use a dynamic origin checker so the cors middleware will reflect the
+// actual requesting Origin when credentials are allowed. Also include
+// custom device headers used by the frontend (x-device-id, etc.) so
+// preflight responses include them in Access-Control-Allow-Headers.
 app.use(cors({
-  origin: CONFIG.CORS_ORIGINS || "http://localhost:3001",
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile/native or curl)
+    if (!origin) return callback(null, true);
+    try {
+      const allowed = Array.isArray(CONFIG.CORS_ORIGINS)
+        ? CONFIG.CORS_ORIGINS
+        : [CONFIG.CORS_ORIGINS];
+      if (allowed.indexOf(origin) !== -1) return callback(null, true);
+    } catch (e) {
+      // fallback: deny
+    }
+    return callback(new Error('Not allowed by CORS'));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-Requested-With",
+    "x-device-id",
+    "x-device-name",
+    "x-device-os",
+    "x-device-browser",
+  ],
   credentials: true,
+  optionsSuccessStatus: 200,
 }));
 
 // Setup Auth
@@ -121,12 +139,12 @@ app.use('/recommendations', createRecommendationsRoutes(verifyTokenMiddleware, o
 // IMPORTANT: Mount to /admin prefix to avoid catching all / routes
 // app.use('/', verifyTokenMiddleware, authorizeAdmin, booksAdminRoutes);
 
-app.use('/admin/books', verifyTokenMiddleware, authorizeAdmin, booksAdminRoutes);
+app.use('/admin/books', verifyTokenMiddleware, checkActiveSessionMiddleware, authorizeAdmin, booksAdminRoutes);
 
 // Books Routes (public catalog + token-aware protected reader endpoints)
 app.use('/', optionalVerifyTokenMiddleware, booksRoutes);
 
-app.use('/admin', verifyTokenMiddleware, authorizeAdmin, adminRoutes);
+app.use('/admin', verifyTokenMiddleware, checkActiveSessionMiddleware, authorizeAdmin, adminRoutes);
 
 // User Management Admin Routes (protected by verifyToken + authorizeAdmin)
 // NOTE: Do not mount adminRoutes at root ('/'), it can hijack '/users/*' endpoints
@@ -134,13 +152,13 @@ app.use('/admin', verifyTokenMiddleware, authorizeAdmin, adminRoutes);
 // Keep admin routes under '/admin' only.
 
 // Reading Session Routes (track user reading progress)
-app.use('/reading', verifyTokenMiddleware, readingSessionRoutes);
+app.use('/reading', verifyTokenMiddleware, checkActiveSessionMiddleware, readingSessionRoutes);
 
 // Shelf Routes (loans, reading sessions, wishlist)
-app.use('/shelf', verifyTokenMiddleware, shelfRoutes);
+app.use('/shelf', verifyTokenMiddleware, checkActiveSessionMiddleware, shelfRoutes);
 
 // Feed Routes (activity, notifications, recommendations)
-app.use('/feed', verifyTokenMiddleware, feedRoutes);
+app.use('/feed', verifyTokenMiddleware, checkActiveSessionMiddleware, feedRoutes);
 
 // Public Reviews (recent community reviews for homepage widgets)
 app.use('/reviews', optionalVerifyTokenMiddleware, reviewsRoutes);
@@ -188,6 +206,20 @@ async function startServer() {
       await createLoginEventsTable();
     } catch (loginSchemaError) {
       console.warn(`⚠️  Login events schema check skipped: ${loginSchemaError.message}`);
+    }
+
+    try {
+      const pool = getPool();
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS review_likes (
+          review_id   UUID NOT NULL,
+          user_id     TEXT NOT NULL,
+          created_at  TIMESTAMPTZ DEFAULT now(),
+          PRIMARY KEY (review_id, user_id)
+        )
+      `);
+    } catch (e) {
+      console.warn('⚠️  review_likes table check skipped:', e.message);
     }
     console.log("✅ Database initialized successfully\n");
     
