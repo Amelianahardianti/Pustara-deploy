@@ -178,7 +178,33 @@ class UserService {
    */
   static async deleteUserByUid(uid) {
     try {
-      const col = isNeon ? 'firebase_uid' : 'uid';
+      const user = await this.getUserByUid(uid);
+      if (!user.success || !user.data) {
+        return { success: false, error: 'User not found' };
+      }
+
+      const userId = user.data.id;
+      const firebaseUid = user.data.firebase_uid || uid;
+      const userIdText = String(userId);
+
+      const cleanupQueries = [
+        ['DELETE FROM active_sessions WHERE firebase_uid = $1', [firebaseUid]],
+        ['DELETE FROM login_events WHERE firebase_uid = $1', [firebaseUid]],
+        ['DELETE FROM review_likes WHERE user_id = $1 OR review_id IN (SELECT id FROM reviews WHERE user_id = $1)', [userIdText]],
+        ['DELETE FROM follows WHERE follower_id = $1 OR following_id = $1', [userIdText]],
+        ['DELETE FROM notifications WHERE user_id = $1 OR actor_id = $1', [userIdText]],
+        ['DELETE FROM queue WHERE user_id = $1', [userIdText]],
+        ['DELETE FROM wishlist WHERE user_id = $1', [userIdText]],
+        ['DELETE FROM reading_sessions WHERE user_id = $1', [userIdText]],
+        ['DELETE FROM loans WHERE user_id = $1', [userIdText]],
+        ['DELETE FROM reviews WHERE user_id = $1', [userIdText]],
+      ];
+
+      for (const [query, params] of cleanupQueries) {
+        await executeQuery(query, params);
+      }
+
+      const col = 'firebase_uid';
       const rows = await executeQuery(
         `DELETE FROM ${isNeon ? 'users' : 'Users'} WHERE ${col} = $1 RETURNING *`,
         [uid]

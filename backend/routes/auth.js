@@ -8,6 +8,7 @@ const CONFIG = require("../constants/config");
 const { createIPRateLimiter } = require("../middleware/rateLimit");
 const { createCaptchaMiddleware } = require("../middleware/captcha");
 const { getPool } = require("../config/database");
+const FirebaseProvider = require("../providers/firebaseProvider");
 
 /**
  * Async error handler wrapper
@@ -33,6 +34,7 @@ function createAuthRoutes(authService, verifyTokenMiddleware, checkActiveSession
   const { insertNotification } = require("../services/notificationService");
   const { sendEmail } = require("../services/emailService");
   const { createSession } = require("../services/sessionService");
+  const firebaseProvider = new FirebaseProvider();
   const authRateLimiter = createIPRateLimiter(
     CONFIG.RATE_LIMIT.AUTH.window,
     CONFIG.RATE_LIMIT.AUTH.max
@@ -203,6 +205,45 @@ function createAuthRoutes(authService, verifyTokenMiddleware, checkActiveSession
         });
       } catch (error) {
         console.error("[/logout-all] Error:", error);
+        return res.status(500).json({
+          success: false,
+          error: CONFIG.ERRORS.INTERNAL_SERVER_ERROR,
+        });
+      }
+    })
+  );
+
+  // POST /auth/delete-account - Delete current user's account (protected, real auth)
+  router.post(
+    "/delete-account",
+    verifyTokenMiddleware,
+    checkActiveSessionMiddleware,
+    asyncHandler(async (req, res) => {
+      try {
+        const uid = req.user.uid;
+
+        const firebaseDeletion = await firebaseProvider.deleteUser(uid);
+        if (!firebaseDeletion.success) {
+          return res.status(500).json({
+            success: false,
+            error: firebaseDeletion.error || CONFIG.ERRORS.INTERNAL_SERVER_ERROR,
+          });
+        }
+
+        const result = await UserService.deleteUserByUid(uid);
+        if (!result.success) {
+          return res.status(500).json({
+            success: false,
+            error: result.error || CONFIG.ERRORS.INTERNAL_SERVER_ERROR,
+          });
+        }
+
+        return res.json({
+          success: true,
+          message: "Account deleted successfully",
+        });
+      } catch (error) {
+        console.error("[/auth/delete-account] Error:", error);
         return res.status(500).json({
           success: false,
           error: CONFIG.ERRORS.INTERNAL_SERVER_ERROR,

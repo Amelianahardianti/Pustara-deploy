@@ -118,6 +118,16 @@ async function ensureNeonShelfSchemaCompatibility() {
     "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS public_reading_list BOOLEAN DEFAULT true",
     "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS public_reviews BOOLEAN DEFAULT true",
     "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS public_followers BOOLEAN DEFAULT true",
+    `CREATE TABLE IF NOT EXISTS review_reports (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      review_id UUID NOT NULL,
+      reporter_id UUID,
+      reason VARCHAR(100) DEFAULT 'Spam',
+      status VARCHAR(50) DEFAULT 'pending',
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+      resolved_at TIMESTAMPTZ
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_review_reports_status ON review_reports(status)`,
   ];
 
   for (const statement of safeStatements) {

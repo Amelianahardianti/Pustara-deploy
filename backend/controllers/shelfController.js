@@ -876,10 +876,13 @@ exports.getMyShelf = async (req, res) => {
              FROM loans l
              JOIN books b ON b.id = l.book_id
              LEFT JOIN LATERAL (
-               SELECT progress_percentage, started_at
+               SELECT progress_percentage, started_at, last_read_at, finished_at
                FROM reading_sessions
-               WHERE book_id = l.book_id AND user_id = l.user_id AND status IN ('reading', 'active', 'paused')
-               ORDER BY started_at DESC LIMIT 1
+               WHERE book_id = l.book_id
+                 AND user_id = l.user_id
+                 AND status IN ('reading', 'active', 'paused', 'finished')
+               ORDER BY COALESCE(finished_at, last_read_at, started_at) DESC NULLS LAST
+               LIMIT 1
              ) rs ON true
              WHERE l.user_id = $1 AND b.is_active = true AND l.returned_at IS NULL AND l.status IN ('active', 'extended')
              ORDER BY b.id, l.borrowed_at DESC
