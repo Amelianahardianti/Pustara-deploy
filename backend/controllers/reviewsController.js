@@ -28,27 +28,54 @@ async function ensureReviewLikesTable() {
 exports.getRecentReviews = async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 8, 50);
+    
+    // Get authenticated user's ID (optional - for privacy check)
+    let viewingUserId = null;
+    if (req.user?.uid) {
+      try {
+        const userRows = toRows(
+          await db.executeQuery(
+            'SELECT id FROM users WHERE firebase_uid = $1 LIMIT 1',
+            [req.user.uid]
+          )
+        );
+        viewingUserId = userRows[0]?.id || null;
+      } catch (_) {
+        // If lookup fails, just continue without viewing_user_id
+      }
+    }
 
+    // Privacy: Only show reviews where user has public_reviews=true OR viewing user is the owner
     const sql = `SELECT r.id AS review_id, r.*,
         COALESCE(u.username, u.display_name) AS username,
         u.display_name,
         u.avatar_url,
+        u.id AS user_id,
         b.id AS book_id, b.title AS book_title, b.authors, b.cover_url
       FROM reviews r
       LEFT JOIN users u ON r.user_id = u.id
       LEFT JOIN books b ON r.book_id = b.id
       WHERE (b.is_active IS NULL OR b.is_active = true)
+        AND (
+          COALESCE(u.public_reviews, true) = true
+          OR r.user_id = $2
+        )
       ORDER BY r.created_at DESC
       LIMIT $1`;
 
     let rows = [];
     try {
-      rows = toRows(await db.executeQuery(sql, [limit]));
+      rows = toRows(await db.executeQuery(sql, [limit, viewingUserId]));
     } catch (innerErr) {
       console.warn('Primary reviews query failed, trying fallback simple query:', innerErr.message || innerErr);
       try {
-        const fallbackSql = `SELECT * FROM reviews ORDER BY created_at DESC LIMIT $1`;
-        rows = toRows(await db.executeQuery(fallbackSql, [limit]));
+        // Fallback: just fetch without complex joins, but still respect privacy
+        const fallbackSql = `SELECT r.* 
+          FROM reviews r
+          LEFT JOIN users u ON r.user_id = u.id
+          WHERE COALESCE(u.public_reviews, true) = true OR r.user_id = $2
+          ORDER BY r.created_at DESC LIMIT $1`;
+        rows = toRows(await db.executeQuery(fallbackSql, [limit, viewingUserId]));
       } catch (fallbackErr) {
         throw fallbackErr;
       }
@@ -87,18 +114,26 @@ exports.getRecentReviews = async (req, res) => {
 /**
  * GET /community/stats  or  GET /reviews/stats
  * Returns real-time community counts: total readers, total reviews, positive-review %.
+ * Only counts reviews where public_reviews=true (respects privacy)
  */
 exports.getCommunityStats = async (req, res) => {
   try {
     const statsSql = `
       SELECT
         (SELECT COUNT(*) FROM users)::int                                         AS total_readers,
-        (SELECT COUNT(*) FROM reviews)::int                                       AS total_reviews,
+        (
+          SELECT COUNT(*)
+          FROM reviews r
+          LEFT JOIN users u ON r.user_id = u.id
+          WHERE COALESCE(u.public_reviews, true) = true
+        )::int                                                                    AS total_reviews,
         (
           SELECT ROUND(
             100.0 * COUNT(*) FILTER (WHERE rating >= 4) / NULLIF(COUNT(*), 0), 1
           )
-          FROM reviews
+          FROM reviews r
+          LEFT JOIN users u ON r.user_id = u.id
+          WHERE COALESCE(u.public_reviews, true) = true
         )::numeric                                                                AS positive_pct
     `;
 

@@ -89,7 +89,7 @@ function parseBooleanQuery(value) {
 
 function withDownloadUrl(book, req) {
   if (!book || !book.id) return book;
-  
+
   // Only provide proxy download URL if the book actually has a file in the database
   // This preserves null/undefined file_url so the frontend can show upload buttons
   if (!book.file_url) return book;
@@ -285,8 +285,8 @@ async function resolveActiveLoanAccess(firebaseUid, bookId) {
     };
   }
 
-  return { 
-    allowed: true, 
+  return {
+    allowed: true,
     userId ,
     dueDate: loanRows[0].due_date,
   };
@@ -300,7 +300,10 @@ exports.getBookReviews = async (req, res) => {
     const limitNum = sanitizePagination(limit, 100, 1, 500);
     const offsetNum = sanitizePagination(offset, 0, 0, 100000);
 
+    console.log('[BookReviews] Request received:', { id, limitQuery: limit, offsetQuery: offset, limitNum, offsetNum });
+
     if (!isUuidLike(id)) {
+      console.log('[BookReviews] INVALID UUID:', id);
       return res.status(400).json({
         success: false,
         message: 'Invalid book id format',
@@ -317,40 +320,76 @@ exports.getBookReviews = async (req, res) => {
     const bookRows = toRows(bookCheck);
 
     if (bookRows.length === 0) {
+      console.log('[BookReviews] BOOK NOT FOUND:', id);
       return res.status(404).json({
         success: false,
         message: 'Book not found',
         error: { code: 'BOOK_NOT_FOUND', id },
       });
     }
+    console.log('[BookReviews] Book found:', id);
+
+    // Get authenticated user's ID (optional - for privacy check)
+    let viewingUserId = null;
+    if (req.user?.uid) {
+      try {
+        const userRows = toRows(
+          await db.executeQuery(
+            'SELECT id FROM users WHERE firebase_uid = $1 LIMIT 1',
+            [req.user.uid]
+          )
+        );
+        viewingUserId = userRows[0]?.id || null;
+      } catch (_) {
+        // If lookup fails, just continue without viewing_user_id
+      }
+    }
 
     // Fetch reviews with user info
+    // Privacy: Only show reviews where public_reviews=true OR the viewing user is the owner
+    // Table uses 'body' column for review text; alias as both 'body' and 'review_text' for compatibility
     const query = `
-      SELECT 
+      SELECT
         r.id,
+        r.user_id,
+        r.book_id,
         r.rating,
         r.body as text,
+        r.body as body,
+        r.body as review_text,
         r.created_at as time,
         COALESCE(u.display_name, u.username) as name,
         u.avatar_url,
         COALESCE(u.display_name, u.username, 'U') as avatar,
-        COUNT(rl.review_id) as likes
+        COALESCE(r.likes, 0) as likes
       FROM reviews r
-      JOIN users u ON r.user_id = u.id
-      LEFT JOIN review_likes rl ON rl.review_id = r.id
+      LEFT JOIN users u ON r.user_id = u.id
       WHERE r.book_id = $1
-      GROUP BY r.id, u.display_name, u.username, u.avatar_url
+        AND (
+          COALESCE(u.public_reviews, true) = true
+          OR r.user_id = $4
+        )
       ORDER BY r.created_at DESC
       LIMIT $2 OFFSET $3
     `;
 
-    const result = await db.executeQuery(query, [id, limitNum, offsetNum]);
+    console.log('[BookReviews] Query:', { bookId: id, limit: limitNum, offset: offsetNum, viewingUserId });
+    const result = await db.executeQuery(query, [id, limitNum, offsetNum, viewingUserId]);
     const reviews = toRows(result);
+    console.log('[BookReviews] Fetched reviews:', reviews.length, 'for book', id);
+    if (reviews.length > 0) {
+      console.log('[BookReviews] First review sample:', { id: reviews[0]?.id, rating: reviews[0]?.rating, textLen: String(reviews[0]?.text || '').length });
+    } else {
+      console.log('[BookReviews] NO REVIEWS FOUND for book:', id);
+    }
 
-    // Get total count
+    // Get total count (respecting privacy)
     const countResult = await db.executeQuery(
-      'SELECT COUNT(*) as total FROM reviews WHERE book_id = $1',
-      [id]
+      `SELECT COUNT(*) as total FROM reviews r
+       LEFT JOIN users u ON r.user_id = u.id
+       WHERE r.book_id = $1
+         AND (COALESCE(u.public_reviews, true) = true OR r.user_id = $2)`,
+      [id, viewingUserId]
     );
 
     const countRows = toRows(countResult);
@@ -358,7 +397,7 @@ exports.getBookReviews = async (req, res) => {
     const totalReviews =
       Number.parseInt(String(countRows[0]?.total || 0), 10) || 0;
 
-    res.json({
+    const responsePayload = {
       success: true,
       data: reviews,
       pagination: {
@@ -366,9 +405,18 @@ exports.getBookReviews = async (req, res) => {
         offset: offsetNum,
         total: totalReviews,
       },
+    };
+
+    console.log('[BookReviews] SENDING RESPONSE:', {
+      success: true,
+      dataCount: reviews.length,
+      dataIsArray: Array.isArray(reviews),
+      total: totalReviews
     });
+
+    res.json(responsePayload);
   } catch (error) {
-    console.error('Error fetching book reviews:', error.message);
+    console.error('[BookReviews] EXCEPTION ERROR:', error.message, error.stack);
 
     res.status(500).json({
       success: false,
@@ -382,7 +430,8 @@ exports.createOrUpdateReview = async (req, res) => {
   try {
     const { book_id, rating, body } = req.body;
     const firebase_uid = req.user?.uid;
-    
+    const { isNeon } = require('../config/database');
+
     if (!firebase_uid) {
     return res.status(401).json({
       success: false,
@@ -450,24 +499,30 @@ exports.createOrUpdateReview = async (req, res) => {
     let values;
     let reviewId;
 
+    // Use appropriate column name based on database type
+    const reviewColumn = isNeon ? 'review_text' : 'body';
+    const returnColumns = isNeon
+      ? 'id, rating, review_text as body, created_at, updated_at'
+      : 'id, rating, body, created_at, updated_at';
+
     if (existingRows.length > 0) {
       // UPDATE existing review
       reviewId = existingRows[0].id;
 
       query = `
         UPDATE reviews
-        SET rating = $1, body = $2, updated_at = NOW()
+        SET rating = $1, ${reviewColumn} = $2, updated_at = NOW()
         WHERE id = $3 AND user_id = $4
-        RETURNING id, rating, body, created_at, updated_at
+        RETURNING ${returnColumns}
       `;
 
       values = [rating, body, reviewId, user_id];
     } else {
       // INSERT new review
       query = `
-        INSERT INTO reviews (user_id, book_id, rating, body)
+        INSERT INTO reviews (user_id, book_id, rating, ${reviewColumn})
         VALUES ($1, $2, $3, $4)
-        RETURNING id, rating, body, created_at, updated_at
+        RETURNING ${returnColumns}
       `;
 
       values = [user_id, book_id, rating, body];
@@ -532,8 +587,8 @@ exports.getBookReadAccess = async (req, res) => {
 
     const sessionRows = toRows(
       await db.executeQuery(
-        `SELECT id, current_page, total_pages, progress_percentage, status, 
-                last_read_at, started_at, finished_at, reading_time_minutes 
+        `SELECT id, current_page, total_pages, progress_percentage, status,
+                last_read_at, started_at, finished_at, reading_time_minutes
         FROM reading_sessions
         WHERE user_id = $1 AND book_id = $2
         ORDER BY last_read_at DESC, started_at DESC
@@ -617,8 +672,8 @@ exports.searchBooks = async (req, res) => {
     const searchQuery = `%${q}%`;
     const query = `
       SELECT id, title, authors, genres, avg_rating, cover_url
-      FROM books 
-      WHERE is_active = true 
+      FROM books
+      WHERE is_active = true
       AND (title ILIKE $1 OR authors::text ILIKE $1)
       LIMIT $2
     `;
@@ -652,7 +707,25 @@ exports.getBookDetail = async (req, res) => {
       });
     }
 
-    const query = 'SELECT * FROM books WHERE id = $1 AND is_active = true';
+    const query = `
+      SELECT
+        b.*,
+        COALESCE(review_stats.review_avg_rating, 0) AS review_avg_rating,
+        COALESCE(review_stats.review_rating_count, 0) AS review_rating_count,
+        COALESCE(review_stats.review_count, 0) AS review_count
+      FROM books b
+      LEFT JOIN (
+        SELECT
+          book_id,
+          COUNT(*) AS review_count,
+          SUM(CASE WHEN rating IS NOT NULL THEN 1 ELSE 0 END) AS review_rating_count,
+          ROUND(COALESCE(AVG(CAST(rating AS DECIMAL(10, 2))), 0), 2) AS review_avg_rating
+        FROM reviews
+        GROUP BY book_id
+      ) review_stats ON review_stats.book_id = b.id
+      WHERE b.id = $1 AND b.is_active = true
+      LIMIT 1
+    `;
     const result = await db.executeQuery(query, [id]);
     const rows = toRows(result);
 
@@ -767,7 +840,7 @@ exports.downloadBookFile = async (req, res) => {
 
     // 3. AMBIL METADATA BUKU
     const bookRows = toRows(await db.executeQuery(
-      'SELECT id, title, file_url, file_type FROM books WHERE id = $1 AND is_active = true', 
+      'SELECT id, title, file_url, file_type FROM books WHERE id = $1 AND is_active = true',
       [bookId]
     ));
     const book = bookRows[0];
@@ -800,7 +873,7 @@ exports.downloadBookFile = async (req, res) => {
     const response = await fetch(finalUrl, {
       headers: { 'Authorization': `Bearer ${serviceKey}` }
     });
-    
+
     if (!response.ok) {
       const errorBody = await response.text().catch(() => '');
       console.error(`❌ Storage Error (${response.status}): ${errorBody}`);
@@ -917,7 +990,7 @@ exports.createBook = async (req, res) => {
 
       fileType = file.mimetype;
       const fileName = `${uuidv4()}-${Date.now()}.pdf`;
-      
+
       try {
         fileUrl = await azureBlob.uploadFile(fileName, file.data, fileType);
         fileSize = file.size;
@@ -1009,7 +1082,7 @@ exports.updateBook = async (req, res) => {
     const genres = rawGenres == null || rawGenres === '' ? null : parseArrayCell(rawGenres);
 
     const query = `
-      UPDATE books 
+      UPDATE books
       SET title = COALESCE($1, title),
           authors = COALESCE($2, authors),
           genres = COALESCE($3, genres),
@@ -1050,7 +1123,7 @@ exports.deleteBook = async (req, res) => {
     const { id } = req.params;
 
     const query = `
-      UPDATE books 
+      UPDATE books
       SET is_active = false, updated_at = now()
       WHERE id = $1
       RETURNING *

@@ -11,6 +11,7 @@ const {
   getReadingTimeStats,
   getUserReadingHistory,
   getTopBooks,
+  getPopularBooks,
 } = require('../services/analyticsService');
 
 /**
@@ -67,6 +68,23 @@ router.get('/top-books', async (req, res) => {
   } catch (error) {
     console.error('Error fetching top books:', error.message);
     res.status(500).json({ success: false, error: 'Failed to fetch top books' });
+  }
+});
+
+// GET /stats/popular-books?limit=40
+// Returns: list of popular books ranked by rating, readers, borrow activity, and recency
+router.get('/popular-books', async (req, res) => {
+  try {
+    const { limit = 40 } = req.query;
+    const books = await getPopularBooks(parseInt(limit, 10));
+
+    res.json({
+      success: true,
+      data: books,
+    });
+  } catch (error) {
+    console.error('Error fetching popular books:', error.message);
+    res.status(500).json({ success: false, error: 'Failed to fetch popular books' });
   }
 });
 

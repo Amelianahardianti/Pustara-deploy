@@ -7,6 +7,7 @@ const express = require("express");
 const CONFIG = require("../constants/config");
 const { createIPRateLimiter } = require("../middleware/rateLimit");
 const { createCaptchaMiddleware } = require("../middleware/captcha");
+const { getPool } = require("../config/database");
 
 /**
  * Async error handler wrapper
@@ -23,13 +24,15 @@ const asyncHandler = (fn) => (req, res, next) => {
  * Create auth routes
  * @param {AuthService} authService - Service instance
  * @param {Function} verifyTokenMiddleware - Token verification middleware
+ * @param {Function} checkActiveSessionMiddleware - Session validation middleware
  * @returns {Router} Express router
  */
-function createAuthRoutes(authService, verifyTokenMiddleware) {
+function createAuthRoutes(authService, verifyTokenMiddleware, checkActiveSessionMiddleware) {
   const router = express.Router();
   const UserService = require("../services/userService");
   const { insertNotification } = require("../services/notificationService");
   const { sendEmail } = require("../services/emailService");
+  const { createSession } = require("../services/sessionService");
   const authRateLimiter = createIPRateLimiter(
     CONFIG.RATE_LIMIT.AUTH.window,
     CONFIG.RATE_LIMIT.AUTH.max
@@ -69,6 +72,7 @@ function createAuthRoutes(authService, verifyTokenMiddleware) {
       
       if (authResult.success) {
         const { uid, email, displayName } = authResult.user;
+        await createSession(req, uid);
         
         // Auto-create user in Azure SQL jika belum ada
         const userExists = await UserService.getUserByUid(uid);
@@ -129,10 +133,11 @@ function createAuthRoutes(authService, verifyTokenMiddleware) {
     })
   );
 
-  // GET /auth/me - Get current user role (protected)
+  // GET /auth/me - Get current user role (protected + session validated)
   router.get(
     "/me",
     verifyTokenMiddleware,
+    checkActiveSessionMiddleware,
     asyncHandler(async (req, res) => {
       const uid = req.user.uid;
       const email = req.user.email;
@@ -158,13 +163,90 @@ function createAuthRoutes(authService, verifyTokenMiddleware) {
     })
   );
 
-  // POST /auth/logout - Logout (protected)
+  // POST /auth/logout - Logout (protected + session validated)
   router.post(
     "/logout",
     verifyTokenMiddleware,
+    checkActiveSessionMiddleware,
     asyncHandler(async (req, res) => {
       const result = await authService.logout(req.user.uid);
       res.status(result.status).json(result);
+    })
+  );
+
+  // POST /auth/logout-all - Logout all sessions (protected, real auth)
+  router.post(
+    "/logout-all",
+    verifyTokenMiddleware,
+    asyncHandler(async (req, res) => {
+      try {
+        // Use real authenticated user uid from Firebase token
+        const uid = req.user.uid;
+
+        const pool = getPool();
+
+        const query = `
+          UPDATE active_sessions
+          SET revoked = TRUE
+          WHERE firebase_uid = $1
+          AND revoked = FALSE
+        `;
+
+        const result = await pool.query(query, [uid]);
+
+        console.log(`[/logout-all] Revoked ${result.rowCount} sessions for uid=${uid}`);
+
+        return res.json({
+          success: true,
+          message: "All sessions revoked",
+          revokedCount: result.rowCount,
+        });
+      } catch (error) {
+        console.error("[/logout-all] Error:", error);
+        return res.status(500).json({
+          success: false,
+          error: CONFIG.ERRORS.INTERNAL_SERVER_ERROR,
+        });
+      }
+    })
+  );
+
+  // GET /auth/sessions - Get active sessions (protected + session validated)
+  router.get(
+    "/sessions",
+    verifyTokenMiddleware,
+    checkActiveSessionMiddleware,
+    asyncHandler(async (req, res) => {
+      try {
+        // Use real authenticated user uid from Firebase token
+        const uid = req.user.uid;
+
+        const pool = getPool();
+
+        const query = `
+            SELECT *
+            FROM active_sessions
+            WHERE firebase_uid = $1
+            AND revoked = FALSE
+            ORDER BY last_active DESC
+        `;
+
+        const result = await pool.query(query, [uid]);
+
+        console.log(`[/auth/sessions] Fetched ${result.rowCount} sessions for uid=${uid}`);
+
+        return res.json({
+            success: true,
+            data: result.rows
+        });
+
+      } catch (error) {
+        console.error("[/auth/sessions] Error:", error);
+        return res.status(500).json({
+            success: false,
+            error: CONFIG.ERRORS.INTERNAL_SERVER_ERROR
+        });
+      }
     })
   );
 

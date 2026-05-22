@@ -112,6 +112,12 @@ async function ensureNeonShelfSchemaCompatibility() {
     "ALTER TABLE IF EXISTS notifications ADD COLUMN IF NOT EXISTS book_id UUID",
     "ALTER TABLE IF EXISTS notifications ADD COLUMN IF NOT EXISTS actor_id UUID",
     "ALTER TABLE IF EXISTS notifications ADD COLUMN IF NOT EXISTS read BOOLEAN DEFAULT false",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active'",
+    "CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS activity_visible BOOLEAN DEFAULT true",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS public_reading_list BOOLEAN DEFAULT true",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS public_reviews BOOLEAN DEFAULT true",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS public_followers BOOLEAN DEFAULT true",
   ];
 
   for (const statement of safeStatements) {
@@ -312,6 +318,7 @@ async function createUsersTable() {
           displayName NVARCHAR(255),
           photoURL NVARCHAR(MAX),
           role NVARCHAR(50) DEFAULT 'reader',
+          status NVARCHAR(50) DEFAULT 'active',
           createdAt DATETIME DEFAULT GETDATE(),
           updatedAt DATETIME DEFAULT GETDATE()
         );
@@ -328,12 +335,41 @@ async function createUsersTable() {
           CREATE INDEX idx_role ON Users(role);
           PRINT 'Added role column to Users table';
         END
+
+        IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'Users' AND COLUMN_NAME = 'status')
+        BEGIN
+          ALTER TABLE Users ADD status NVARCHAR(50) DEFAULT 'active';
+          CREATE INDEX idx_status ON Users(status);
+          PRINT 'Added status column to Users table';
+        END
       END
     `);
     console.log('✅ Users table ready');
   } catch (error) {
     console.error('❌ Error creating users table:', error);
     throw error;
+  }
+}
+
+/**
+ * Neon-only users schema compatibility patcher.
+ * Adds admin-facing fields that may be missing from older deployments.
+ */
+async function ensureNeonUsersSchemaCompatibility() {
+  if (!isNeon) return;
+  if (!pgPool) throw new Error('Neon DB not initialized. Call initializeDatabase() first');
+
+  const statements = [
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active'",
+    "CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)",
+  ];
+
+  for (const statement of statements) {
+    try {
+      await pgPool.query(statement);
+    } catch (error) {
+      console.warn(`⚠️  Users schema compatibility statement skipped: ${error.message}`);
+    }
   }
 }
 
@@ -412,6 +448,7 @@ async function closeDatabase() {
 module.exports = {
   initializeDatabase,
   ensureNeonShelfSchemaCompatibility,
+  ensureNeonUsersSchemaCompatibility,
   executeQuery,
   getPool,
   createUsersTable,

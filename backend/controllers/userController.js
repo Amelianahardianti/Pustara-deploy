@@ -345,8 +345,8 @@ async function resolveUsernameOrIdToUserId(usernameOrId) {
   })();
   const candidate = decoded.startsWith('@') ? decoded.slice(1) : decoded;
 
-  // If it's a numeric ID, try that first
-  if (/^\d+$/.test(candidate)) {
+  // If it already looks like a direct user ID, use it as-is.
+  if (/^\d+$/.test(candidate) || /^[0-9a-fA-F-]{16,}$/.test(candidate)) {
     return candidate;
   }
 
@@ -412,10 +412,13 @@ function mapUserCard(user, isFollowing = false) {
   };
 }
 
-async function buildUserProfile(targetUserId, actorId = null) {
+async function buildUserProfile(targetUserId, actorId = null, userUid = null) {
   const userRows = toRows(
     await db.executeQuery(
-      'SELECT id, firebase_uid, username, display_name, email, bio, avatar_url, preferred_genres, reading_streak, total_read, created_at, updated_at FROM users WHERE id = $1',
+      `SELECT id, firebase_uid, username, display_name, email, bio, avatar_url, preferred_genres,
+              reading_streak, total_read, created_at, updated_at,
+              activity_visible, public_reading_list, public_reviews
+       FROM users WHERE id = $1`,
       [targetUserId]
     )
   );
@@ -426,6 +429,31 @@ async function buildUserProfile(targetUserId, actorId = null) {
 
   const user = userRows[0];
   const identity = buildPublicIdentity(user);
+
+  // ─────────────────────────────────────────────────────────────────────
+  // PRIVACY ENFORCEMENT: Determine what data can be viewed
+  // ─────────────────────────────────────────────────────────────────────
+  // isOwner: viewing user is the target user (always sees everything)
+  // Primary check: actorId (internal DB ID) matches targetUserId
+  // Fallback check: firebase_uid matches if async lookup failed
+  let isOwner = actorId && String(actorId) === String(targetUserId);
+  
+  // DEFENSIVE FALLBACK: If actorId is null but user is authenticated
+  // Use firebase_uid comparison to detect owner (in case async lookup failed)
+  if (!isOwner && userUid && user.firebase_uid === userUid) {
+    console.warn(
+      '[buildUserProfile] Using firebase_uid fallback for owner detection. ' +
+      'firebase_uid:', userUid, 
+      'targetUserId:', targetUserId
+    );
+    isOwner = true;
+  }
+  
+  // Privacy flags: default to true (public) if not explicitly false
+  // Reuses same pattern as review privacy checks
+  const canViewReading = isOwner || (user.public_reading_list !== false);
+  const canViewReviews = isOwner || (user.public_reviews !== false);
+  const canViewActivity = isOwner || (user.activity_visible !== false);
 
   const [followersCount, followingCount] = await Promise.all([
     countFollowers(targetUserId),
@@ -458,119 +486,229 @@ async function buildUserProfile(targetUserId, actorId = null) {
     resetDayKey: null,
   };
 
-  try {
-    const readingRows = toRows(
-      await db.executeQuery(
-        `SELECT b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
-                rs.progress_percentage, rs.last_read_at
-         FROM reading_sessions rs
-         JOIN books b ON b.id = rs.book_id
-         WHERE rs.user_id = $1
-           AND b.is_active = true
-           AND (rs.status = 'reading' OR rs.status = 'active')
-         ORDER BY rs.last_read_at DESC
-         LIMIT 5`,
-        [targetUserId]
-      )
-    );
+  // READING DATA: Gated by public_reading_list
+  // Only fetch currently_reading books if user has reading list public OR actor is owner
+  if (canViewReading) {
+    try {
+      const readingRows = toRows(
+        await db.executeQuery(
+          `SELECT b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
+                  rs.progress_percentage, rs.last_read_at
+           FROM reading_sessions rs
+           JOIN books b ON b.id = rs.book_id
+           WHERE rs.user_id = $1
+             AND b.is_active = true
+             AND (rs.status = 'reading' OR rs.status = 'active')
+           ORDER BY rs.last_read_at DESC
+           LIMIT 5`,
+          [targetUserId]
+        )
+      );
 
-    currentlyReading = readingRows.map((row) => ({
-      ...formatBookSummary(row),
-      progress_percentage: Number(row.progress_percentage || 0),
-      last_read_at: row.last_read_at || null,
-    }));
-  } catch (_) {
+      currentlyReading = readingRows.map((row) => ({
+        ...formatBookSummary(row),
+        progress_percentage: Number(row.progress_percentage || 0),
+        last_read_at: row.last_read_at || null,
+      }));
+    } catch (_) {
+      currentlyReading = [];
+    }
+
+    // WISHLIST DATA: Gated by public_reading_list
+    // Only fetch wishlist books if user has reading list public OR actor is owner
+    try {
+      const likedRows = toRows(
+        await db.executeQuery(
+          `SELECT b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages, w.added_at
+           FROM wishlist w
+           JOIN books b ON b.id = w.book_id
+           WHERE w.user_id = $1
+             AND b.is_active = true
+           ORDER BY w.added_at DESC
+           LIMIT 10`,
+          [targetUserId]
+        )
+      );
+
+      likedBooks = likedRows.map((row) => ({
+        ...formatBookSummary(row),
+        liked_at: row.added_at || null,
+      }));
+    } catch (_) {
+      likedBooks = [];
+    }
+  } else {
+    // Privacy: reading_list is private - return empty arrays
     currentlyReading = [];
-  }
-
-  try {
-    const likedRows = toRows(
-      await db.executeQuery(
-        `SELECT b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages, w.added_at
-         FROM wishlist w
-         JOIN books b ON b.id = w.book_id
-         WHERE w.user_id = $1
-           AND b.is_active = true
-         ORDER BY w.added_at DESC
-         LIMIT 10`,
-        [targetUserId]
-      )
-    );
-
-    likedBooks = likedRows.map((row) => ({
-      ...formatBookSummary(row),
-      liked_at: row.added_at || null,
-    }));
-  } catch (_) {
     likedBooks = [];
   }
 
-  try {
-    const finishedRows = toRows(
-      await db.executeQuery(
-        `SELECT b.genres
-         FROM reading_sessions rs
-         JOIN books b ON b.id = rs.book_id
-         WHERE rs.user_id = $1
-           AND (
-             COALESCE(rs.progress_percentage, 0) >= 100
-             OR COALESCE(rs.current_page, 0) >= COALESCE(rs.total_pages, 0)
-           )
-           AND b.is_active = true`,
-        [targetUserId]
-      )
-    );
-    finishedCount = Number(finishedRows.length || 0);
-  } catch (_) {
+  // READING HISTORY COUNT: Gated by public_reading_list
+  // Only compute finished books count if reading list is public OR actor is owner
+  if (canViewReading) {
+    try {
+      // Count finished history items using the same logic as /shelf/me
+      const finishedCountRows = toRows(
+        await db.executeQuery(
+          `SELECT COUNT(*) AS total FROM (
+             -- returned loans
+             SELECT
+               b.id,
+               CASE
+                 WHEN rs.id IS NULL THEN 'unfinished'
+                 WHEN COALESCE(rs.progress_percentage, 0) >= 100
+                   OR COALESCE(rs.current_page, 0) >= COALESCE(rs.total_pages, 0) THEN 'finished'
+                 ELSE 'unfinished'
+               END AS history_status
+             FROM loans l
+             JOIN books b ON b.id = l.book_id
+             LEFT JOIN LATERAL (
+               SELECT id, current_page, total_pages, progress_percentage, finished_at, started_at, reading_time_minutes
+               FROM reading_sessions
+               WHERE book_id = l.book_id AND user_id = l.user_id
+               ORDER BY COALESCE(finished_at, last_read_at, started_at) DESC
+               LIMIT 1
+             ) rs ON true
+             WHERE l.user_id = $1
+               AND b.is_active = true
+               AND l.returned_at IS NOT NULL
+
+             UNION ALL
+
+             -- finished reading sessions that are not tied to a returned loan
+             SELECT
+               b.id,
+               CASE
+                 WHEN COALESCE(rs.progress_percentage, 0) < 100
+                  OR COALESCE(rs.current_page, 0) < COALESCE(rs.total_pages, 0) THEN 'unfinished'
+                 ELSE 'finished'
+               END AS history_status
+             FROM reading_sessions rs
+             JOIN books b ON b.id = rs.book_id
+             WHERE rs.user_id = $1
+               AND b.is_active = true
+               AND rs.status = 'finished'
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM loans l
+                 WHERE l.book_id = rs.book_id
+                   AND l.user_id = rs.user_id
+                   AND l.returned_at IS NOT NULL
+               )
+           ) sub WHERE history_status = 'finished'`,
+          [targetUserId]
+        )
+      );
+      finishedCount = Number(finishedCountRows[0]?.total ?? 0);
+    } catch (_) {
+      finishedCount = 0;
+    }
+  } else {
+    // Privacy: reading_list is private - don't expose finished count
     finishedCount = 0;
   }
 
-  try {
-    const borrowedGenreRows = toRows(
-      await db.executeQuery(
-        `SELECT b.genres
-         FROM loans l
-         JOIN books b ON b.id = l.book_id
-         WHERE l.user_id = $1
-           AND b.is_active = true`,
-        [targetUserId]
-      )
-    );
-    favoriteGenres = buildGenreStats(borrowedGenreRows, 5);
-  } catch (_) {
+  // FAVORITE GENRES: Gated by public_reading_list
+  // Only compute favorite genres if reading list is public OR actor is owner
+  if (canViewReading) {
+    try {
+      const borrowedGenreRows = toRows(
+        await db.executeQuery(
+          `SELECT b.genres
+           FROM loans l
+           JOIN books b ON b.id = l.book_id
+           WHERE l.user_id = $1
+             AND b.is_active = true`,
+          [targetUserId]
+        )
+      );
+      favoriteGenres = buildGenreStats(borrowedGenreRows, 5);
+    } catch (_) {
+      favoriteGenres = [];
+    }
+  } else {
+    // Privacy: reading_list is private - don't expose favorite genres
     favoriteGenres = [];
   }
 
-  try {
-    const reviewRows = toRows(
-      await db.executeQuery(
-        `SELECT COUNT(*) AS total
-         FROM reviews
-         WHERE user_id = $1`,
-        [targetUserId]
-      )
-    );
-    reviewsWritten = Number(reviewRows[0]?.total || 0);
-  } catch (_) {
+  // ACTIVE BORROWED COUNT: Gated by public_reading_list (used for profile stats)
+  // Only fetch if reading list is public OR actor is owner
+  let activeBorrowedCount = 0;
+  if (canViewReading) {
+    try {
+      const activeBorrowedRows = toRows(
+        await db.executeQuery(
+          `SELECT COUNT(DISTINCT b.id) AS total
+           FROM loans l
+           JOIN books b ON b.id = l.book_id
+           WHERE l.user_id = $1
+             AND b.is_active = true
+             AND l.returned_at IS NULL
+             AND l.status IN ('active', 'extended')`,
+          [targetUserId]
+        )
+      );
+      activeBorrowedCount = Number(activeBorrowedRows[0]?.total ?? 0);
+    } catch (_) {
+      activeBorrowedCount = 0;
+    }
+  } else {
+    activeBorrowedCount = 0;
+  }
+
+  // REVIEWS COUNT: Gated by public_reviews
+  // Only fetch review count if user has reviews public OR actor is owner
+  if (canViewReviews) {
+    try {
+      const reviewRows = toRows(
+        await db.executeQuery(
+          `SELECT COUNT(*) AS total
+           FROM reviews
+           WHERE user_id = $1`,
+          [targetUserId]
+        )
+      );
+      reviewsWritten = Number(reviewRows[0]?.total || 0);
+    } catch (_) {
+      reviewsWritten = 0;
+    }
+  } else {
+    // Privacy: reviews are private - don't expose review count
     reviewsWritten = 0;
   }
 
-  try {
-    const streakRows = toRows(
-      await db.executeQuery(
-        `SELECT login_at AS event_time
-         FROM login_events
-         WHERE firebase_uid = $1
-           AND login_at IS NOT NULL
-         ORDER BY login_at DESC
-         LIMIT 400`,
-        [user.firebase_uid || user.uid || user.email || targetUserId]
-      )
-    );
-    const streakTimestamps = streakRows.map((row) => row.event_time);
-    computedStreak = calculateConsecutiveStreak(streakTimestamps);
-    streakSummary = buildStreakSummary(streakTimestamps);
-  } catch (_) {
+  // ACTIVITY/STREAK DATA: Gated by activity_visible
+  // Only fetch activity data if user has activity visible OR actor is owner
+  if (canViewActivity) {
+    try {
+      const streakRows = toRows(
+        await db.executeQuery(
+          `SELECT login_at AS event_time
+           FROM login_events
+           WHERE firebase_uid = $1
+             AND login_at IS NOT NULL
+           ORDER BY login_at DESC
+           LIMIT 400`,
+          [user.firebase_uid || user.uid || user.email || targetUserId]
+        )
+      );
+      const streakTimestamps = streakRows.map((row) => row.event_time);
+      computedStreak = calculateConsecutiveStreak(streakTimestamps);
+      streakSummary = buildStreakSummary(streakTimestamps);
+    } catch (_) {
+      computedStreak = 0;
+      streakSummary = {
+        currentStreak: 0,
+        isActiveToday: false,
+        lastActiveDayKey: null,
+        lastStreakStartDayKey: null,
+        lastStreakEndDayKey: null,
+        lastStreakLength: 0,
+        resetDayKey: null,
+      };
+    }
+  } else {
+    // Privacy: activity is private - don't expose streak data
     computedStreak = 0;
     streakSummary = {
       currentStreak: 0,
@@ -609,7 +747,6 @@ async function buildUserProfile(targetUserId, actorId = null) {
     stats: {
       total_read: resolvedTotalRead,
       reading_streak: resolvedStreak,
-      borrowed_books: Number(currentlyReading.length || 0),
       reviews_written: reviewsWritten,
       favorite_genres: favoriteGenres,
     },
@@ -627,6 +764,15 @@ exports.getUserProfile = async (req, res) => {
     const { id } = req.params;
     console.log(`[getUserProfile] Incoming request for: ${id}`);
     const actorId = await resolveActorUserId(req);
+    
+    // DEFENSIVE: Log if async lookup failed for authenticated users
+    if (!actorId && req.user?.uid) {
+      console.warn(
+        '[getUserProfile] WARNING: resolveActorUserId returned null for authenticated user. ' +
+        'firebase_uid:', req.user.uid, 
+        'Will use firebase_uid fallback in buildUserProfile.'
+      );
+    }
 
     // Resolve username or ID to actual user ID
     const targetUserId = await resolveUsernameOrIdToUserId(id);
@@ -640,7 +786,7 @@ exports.getUserProfile = async (req, res) => {
       });
     }
 
-    const profile = await buildUserProfile(targetUserId, actorId);
+    const profile = await buildUserProfile(targetUserId, actorId, req.user?.uid);
     if (!profile) {
       return res.status(404).json({
         success: false,
@@ -1164,5 +1310,112 @@ exports.getMyFollowers = async (req, res) => {
   } catch (error) {
     console.error('Error fetching followers list:', error.message);
     res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * Get privacy settings for authenticated user
+ * GET /api/user/privacy-settings
+ */
+exports.getPrivacySettings = async (req, res) => {
+  try {
+    if (!req.user?.uid) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required',
+      });
+    }
+
+    const userResult = await UserService.getUserByUid(req.user.uid);
+    if (!userResult.success || !userResult.data) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found',
+      });
+    }
+
+    const user = userResult.data;
+    return res.json({
+      success: true,
+      data: {
+        activity_visible: Boolean(user.activity_visible ?? true),
+        public_reading_list: Boolean(user.public_reading_list ?? true),
+        public_reviews: Boolean(user.public_reviews ?? true),
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching privacy settings:', error.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to fetch privacy settings',
+    });
+  }
+};
+
+/**
+ * Update privacy settings for authenticated user
+ * PUT /api/user/privacy-settings
+ * Body: { activity_visible?, public_reading_list?, public_reviews? }
+ */
+exports.updatePrivacySettings = async (req, res) => {
+  try {
+    if (!req.user?.uid) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required',
+      });
+    }
+
+    const updates = {};
+    const allowedFields = ['activity_visible', 'public_reading_list', 'public_reviews'];
+
+    // Validate and collect updates
+    for (const field of allowedFields) {
+      if (field in req.body) {
+        const value = req.body[field];
+        // Coerce to boolean safely: true/false/"true"/"false"/1/0 all work
+        if (value === true || value === false || value === 'true' || value === 'false' || value === 1 || value === 0) {
+          updates[field] = Boolean(value === true || value === 'true' || value === 1);
+        } else if (value !== null && value !== undefined) {
+          return res.status(400).json({
+            success: false,
+            message: `Invalid value for ${field}: must be boolean`,
+          });
+        }
+      }
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid privacy settings to update',
+      });
+    }
+
+    // Update using existing UserService
+    const updateResult = await UserService.updateUser(req.user.uid, updates);
+    if (!updateResult.success || !updateResult.data) {
+      return res.status(400).json({
+        success: false,
+        message: updateResult.error || 'Failed to update privacy settings',
+      });
+    }
+
+    const updatedUser = updateResult.data;
+    return res.json({
+      success: true,
+      message: 'Privacy settings updated successfully',
+      data: {
+        activity_visible: Boolean(updatedUser.activity_visible ?? true),
+        public_reading_list: Boolean(updatedUser.public_reading_list ?? true),
+        public_reviews: Boolean(updatedUser.public_reviews ?? true),
+      },
+    });
+  } catch (error) {
+    console.error('Error updating privacy settings:', error.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to update privacy settings',
+    });
   }
 };

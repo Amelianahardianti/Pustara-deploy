@@ -34,10 +34,11 @@ const CONFIG = require("./constants/config");
 const FirebaseProvider = require("./providers/firebaseProvider");
 const AuthService = require("./services/authService");
 const { createVerifyTokenMiddleware, createOptionalVerifyTokenMiddleware } = require("./middleware/auth");
+const { createCheckActiveSessionMiddleware } = require("./middleware/checkActiveSession");
 const { authorizeAdmin } = require("./middleware/adminAuth");
 const { createAuthRoutes } = require("./routes/auth");
 const createSurveyRoutes = require("./routes/survey");
-const { initializeDatabase, ensureNeonShelfSchemaCompatibility, createLoginEventsTable, createUsersTable, createUserSurveyTable } = require("./config/database");
+const { initializeDatabase, ensureNeonShelfSchemaCompatibility, ensureNeonUsersSchemaCompatibility, createLoginEventsTable, createUsersTable, createUserSurveyTable } = require("./config/database");
 
 // Routes
 const createRecommendationsRoutes = require('./routes/recommendations');
@@ -91,6 +92,7 @@ const authProvider = new FirebaseProvider();
 const authService = new AuthService(authProvider);
 const verifyTokenMiddleware = createVerifyTokenMiddleware(authService);
 const optionalVerifyTokenMiddleware = createOptionalVerifyTokenMiddleware(authService);
+const checkActiveSessionMiddleware = createCheckActiveSessionMiddleware();
 
 // ==========================================
 // ROUTES
@@ -102,7 +104,7 @@ app.get("/", (req, res) => {
 });
 
 // Auth Routes
-app.use("/auth", createAuthRoutes(authService, verifyTokenMiddleware));
+app.use("/auth", createAuthRoutes(authService, verifyTokenMiddleware, checkActiveSessionMiddleware));
 
 // Survey Routes
 app.use("/survey", createSurveyRoutes(verifyTokenMiddleware));
@@ -176,6 +178,11 @@ async function startServer() {
       await ensureNeonShelfSchemaCompatibility();
     } catch (schemaError) {
       console.warn(`⚠️  Shelf schema compatibility check skipped: ${schemaError.message}`);
+    }
+    try {
+      await ensureNeonUsersSchemaCompatibility();
+    } catch (schemaError) {
+      console.warn(`⚠️  Users schema compatibility check skipped: ${schemaError.message}`);
     }
     try {
       await createLoginEventsTable();
