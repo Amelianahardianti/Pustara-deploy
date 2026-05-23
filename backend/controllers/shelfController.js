@@ -63,6 +63,7 @@ const SHELF_DAY_FORMATTER = new Intl.DateTimeFormat('en-US', {
   month: '2-digit',
   day: '2-digit',
 });
+const QUEUE_PICKUP_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 
 function toDayKeyInTimeZone(input) {
   if (!input) return null;
@@ -297,6 +298,160 @@ async function removeQueueEntry(userId, bookId) {
   return normalizeQueuePositions(bookId);
 }
 
+async function removeQueueEntryById(entryId, bookId) {
+  await db.executeQuery('DELETE FROM queue WHERE id = $1', [entryId]);
+  return normalizeQueuePositions(bookId);
+}
+
+function queueNotifiedAtMs(row) {
+  const raw = row?.notified_at || null;
+  if (!raw) return null;
+  const ms = new Date(raw).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function isQueueNotified(row) {
+  const value = row?.notified;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') return ['true', '1', 'yes'].includes(value.toLowerCase());
+  return false;
+}
+
+function queueHoldExpired(row) {
+  const notifiedAt = queueNotifiedAtMs(row);
+  if (!notifiedAt) return false;
+  return Date.now() - notifiedAt >= QUEUE_PICKUP_WINDOW_MS;
+}
+
+async function markQueueEntryNotified(entryId) {
+  if (!entryId) return;
+
+  try {
+    await db.executeQuery(
+      `UPDATE queue
+       SET notified = true,
+           notified_at = COALESCE(notified_at, CURRENT_TIMESTAMP)
+       WHERE id = $1`,
+      [entryId]
+    );
+  } catch {
+    try {
+      await db.executeQuery('UPDATE queue SET notified = true WHERE id = $1', [entryId]);
+    } catch {
+      // Some deployments may not have queue notification columns yet.
+    }
+  }
+}
+
+async function notifyQueueEntryAvailable(entry, bookId, bookTitle) {
+  const nextUserId = String(entry?.user_id || '');
+  if (!nextUserId) return null;
+
+  await notifyUserAndSendEmail({
+    userId: nextUserId,
+    type: 'queue',
+    title: 'Buku Tersedia Untukmu',
+    body: `Buku "${bookTitle}" sudah tersedia dan sedang direservasi untukmu selama 3 hari. Segera pinjam sebelum antrean bergerak.`,
+    bookId,
+    emailSubject: 'Pustara - Buku yang Kamu Antrekan Sudah Tersedia',
+  });
+
+  await markQueueEntryNotified(entry.id);
+  return {
+    user_id: nextUserId,
+    queue_position: Number(entry.position || entry.normalized_position || 1),
+  };
+}
+
+async function expireQueueHold(entry, bookId, bookTitle) {
+  const userId = String(entry?.user_id || '');
+  if (!entry?.id || !userId) return;
+
+  await removeQueueEntryById(entry.id, bookId);
+
+  await notifyUserAndSendEmail({
+    userId,
+    type: 'queue',
+    title: 'Reservasi Antrean Dibatalkan',
+    body: `Reservasi antrean untuk buku "${bookTitle}" otomatis dibatalkan karena belum dipinjam dalam 3 hari.`,
+    bookId,
+    emailSubject: 'Pustara - Reservasi Antrean Buku Dibatalkan',
+  }).catch((error) => {
+    console.warn('[Shelf] Queue expiration notification warning:', error?.message || error);
+  });
+}
+
+async function getBookQueueSnapshot(bookId) {
+  const rows = toRows(
+    await db.executeQuery(
+      'SELECT id, title, COALESCE(available, 0) AS available FROM books WHERE id = $1 LIMIT 1',
+      [bookId]
+    )
+  );
+  return rows[0] || null;
+}
+
+async function reconcileAvailableQueueHold(bookId, providedTitle = null) {
+  const book = await getBookQueueSnapshot(bookId);
+  const available = Number(book?.available || 0);
+  const bookTitle = String(providedTitle || book?.title || 'Buku');
+
+  if (available <= 0) {
+    return { book, queueRows: await normalizeQueuePositions(bookId), notifiedUser: null };
+  }
+
+  let notifiedUser = null;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const queueRows = await normalizeQueuePositions(bookId);
+    const next = queueRows[0];
+    if (!next) return { book, queueRows, notifiedUser };
+
+    if (isQueueNotified(next)) {
+      if (queueHoldExpired(next)) {
+        await expireQueueHold(next, bookId, bookTitle);
+        continue;
+      }
+
+      if (!queueNotifiedAtMs(next)) {
+        await markQueueEntryNotified(next.id);
+      }
+
+      return { book, queueRows, notifiedUser };
+    }
+
+    notifiedUser = await notifyQueueEntryAvailable(next, bookId, bookTitle).catch((error) => {
+      console.warn('[Shelf] Queue availability notification warning:', error?.message || error);
+      return null;
+    });
+    if (!notifiedUser && next.id) {
+      await markQueueEntryNotified(next.id);
+    }
+
+    return { book, queueRows: await normalizeQueuePositions(bookId), notifiedUser };
+  }
+
+  return { book, queueRows: await normalizeQueuePositions(bookId), notifiedUser };
+}
+
+async function getBooksWithAvailableQueuedCopies() {
+  const rows = toRows(
+    await db.executeQuery(
+      `SELECT DISTINCT b.id, b.title
+       FROM books b
+       JOIN queue q ON q.book_id = b.id
+       WHERE COALESCE(b.available, 0) > 0
+         AND b.is_active = true`,
+      []
+    )
+  );
+
+  return rows.map((row) => ({
+    id: String(row.id || ''),
+    title: String(row.title || 'Buku'),
+  })).filter((row) => row.id);
+}
+
 async function ensureReadingSession(userId, bookId) {
   const existingRows = toRows(
     await db.executeQuery(
@@ -360,42 +515,14 @@ async function notifyUserAndSendEmail({ userId, type, title, body, bookId = null
 }
 
 async function notifyNextQueuedUser(bookId, bookTitle) {
-  const queueRows = await normalizeQueuePositions(bookId);
-  if (queueRows.length === 0) {
-    return null;
-  }
+  const result = await reconcileAvailableQueueHold(bookId, bookTitle);
+  if (result.notifiedUser) return result.notifiedUser;
 
-  const next = queueRows[0];
-  const nextUserId = String(next.user_id || '');
-  if (!nextUserId) return null;
-
-  if (Boolean(next.notified)) {
-    return {
-      user_id: nextUserId,
-      queue_position: Number(next.position || next.normalized_position || 1),
-    };
-  }
-
-  await notifyUserAndSendEmail({
-    userId: nextUserId,
-    type: 'queue',
-    title: 'Buku Tersedia Untukmu',
-    body: `Buku "${bookTitle}" sudah tersedia. Segera buka Pustara untuk meminjam sebelum antrean bergerak.`,
-    bookId,
-    emailSubject: 'Pustara - Buku yang Kamu Antrekan Sudah Tersedia',
-  });
-
-  try {
-    await db.executeQuery(
-      'UPDATE queue SET notified = true WHERE id = $1',
-      [next.id]
-    );
-  } catch {
-    // Some deployments may not have notified column. Notification is still sent.
-  }
+  const next = result.queueRows?.[0];
+  if (!next) return null;
 
   return {
-    user_id: nextUserId,
+    user_id: String(next.user_id || ''),
     queue_position: Number(next.position || next.normalized_position || 1),
   };
 }
@@ -408,50 +535,18 @@ exports.getMyBookStatus = async (req, res) => {
     }
 
     const { bookId } = req.params;
-    const [loan, wishlist, queueEntry, queueCount, bookRow] = await Promise.all([
+    await reconcileAvailableQueueHold(bookId);
+
+    const [loan, wishlist, queueEntry, queueCount] = await Promise.all([
       getActiveLoan(actorUserId, bookId),
       getWishlistRow(actorUserId, bookId),
       getQueueEntry(actorUserId, bookId),
       getQueueCount(bookId),
-      (async () => {
-        const rows = toRows(
-          await db.executeQuery(
-            'SELECT id, title, COALESCE(available, 0) AS available FROM books WHERE id = $1 LIMIT 1',
-            [bookId]
-          )
-        );
-        return rows[0] || null;
-      })(),
     ]);
 
     const queuePosition = queueEntry
       ? Number(queueEntry.position || queueEntry.normalized_position || 0)
       : null;
-    const availableCount = Number(bookRow?.available || 0);
-
-    if (
-      queueEntry &&
-      queuePosition === 1 &&
-      availableCount > 0 &&
-      !Boolean(queueEntry.notified)
-    ) {
-      await notifyUserAndSendEmail({
-        userId: actorUserId,
-        type: 'queue',
-        title: 'Buku Tersedia Untukmu',
-        body: `Buku "${String(bookRow?.title || 'Buku')}" sudah tersedia. Segera buka Pustara untuk meminjam sebelum antrean bergerak.`,
-        bookId,
-        emailSubject: 'Pustara - Buku yang Kamu Antrekan Sudah Tersedia',
-      });
-
-      if (queueEntry.id) {
-        try {
-          await db.executeQuery('UPDATE queue SET notified = true WHERE id = $1', [queueEntry.id]);
-        } catch {
-          // Some deployments may not have notified column. Notification is still sent.
-        }
-      }
-    }
 
     res.json({
       success: true,
@@ -507,6 +602,7 @@ exports.borrowBook = async (req, res) => {
       });
     }
 
+    await reconcileAvailableQueueHold(bookId, book.title);
     const existingQueueEntry = await getQueueEntry(actorUserId, bookId);
 
     if (available <= 0) {
@@ -1108,6 +1204,7 @@ exports.joinQueue = async (req, res) => {
     }
 
     const book = bookRows[0];
+    await reconcileAvailableQueueHold(bookId, book.title);
     const available = Number(book.available || 0);
     if (available > 0) {
       const queueCount = await getQueueCount(bookId);
@@ -1146,14 +1243,18 @@ exports.joinQueue = async (req, res) => {
     const updatedEntry = await getQueueEntry(actorUserId, bookId);
     const queueCount = await getQueueCount(bookId);
 
-    await notifyUserAndSendEmail({
-      userId: actorUserId,
-      type: 'queue',
-      title: 'Berhasil Masuk Antrean',
-      body: `Kamu masuk antrean untuk buku "${book.title}". Posisi antreanmu saat ini: ${updatedEntry?.position || updatedEntry?.normalized_position || nextPosition}.`,
-      bookId,
-      emailSubject: 'Pustara - Konfirmasi Antrean Buku',
-    });
+    try {
+      await notifyUserAndSendEmail({
+        userId: actorUserId,
+        type: 'queue',
+        title: 'Berhasil Masuk Antrean',
+        body: `Kamu masuk antrean untuk buku "${book.title}". Posisi antreanmu saat ini: ${updatedEntry?.position || updatedEntry?.normalized_position || nextPosition}.`,
+        bookId,
+        emailSubject: 'Pustara - Konfirmasi Antrean Buku',
+      });
+    } catch (notificationError) {
+      console.warn('Queue notification failed after successful join:', notificationError.message);
+    }
 
     return res.status(201).json({
       success: true,
@@ -1214,4 +1315,20 @@ exports.leaveQueue = async (req, res) => {
     console.error('Error leaving queue:', error.message);
     return res.status(500).json({ success: false, message: 'Failed to leave queue', error: error.message });
   }
+};
+
+exports.expireStaleQueueReservations = async () => {
+  const books = await getBooksWithAvailableQueuedCopies();
+  let processed = 0;
+
+  for (const book of books) {
+    try {
+      await reconcileAvailableQueueHold(book.id, book.title);
+      processed += 1;
+    } catch (error) {
+      console.warn('[Shelf] Queue reservation reconciliation warning:', error?.message || error);
+    }
+  }
+
+  return { processed };
 };
