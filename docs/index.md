@@ -37,7 +37,7 @@ Keterbatasan tersebut tercermin, antara lain, pada sumber daya digital yang jara
 
 ## Ide Solusi
 1. Sistem rekomendasi bacaan berbasis AI sesuai minat pengguna 
-2. Fitur komentar dan review/rating buku untuk membangun komunitas membaca 
+2. Fitur review dan rating buku untuk membangun komunitas membaca 
 3. Desain UI modern dan intuitif yang menarik bagi kalangan muda 
 4. Personalisasi setiap akun dapat melihat riwayat baca sepanjang tahun (beserta lama waktu membaca), melihat buku yang telah mereka review, saling follow dengan akun lainnya untuk melihat aktivitas membaca mereka. 
 5. Sistem pinjam berbasis antrean dengan notifikasi yang jelas dan maksimum batas peminjaman. 
