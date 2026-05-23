@@ -56,6 +56,42 @@ function formatBook(row) {
   };
 }
 
+const SHELF_TIME_ZONE = 'Asia/Jakarta';
+const SHELF_DAY_FORMATTER = new Intl.DateTimeFormat('en-US', {
+  timeZone: SHELF_TIME_ZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
+function toDayKeyInTimeZone(input) {
+  if (!input) return null;
+
+  const date = new Date(input);
+  if (Number.isNaN(date.getTime())) return null;
+
+  const parts = SHELF_DAY_FORMATTER.formatToParts(date);
+  const year = parts.find((part) => part.type === 'year')?.value;
+  const month = parts.find((part) => part.type === 'month')?.value;
+  const day = parts.find((part) => part.type === 'day')?.value;
+
+  if (!year || !month || !day) return null;
+  return `${year}-${month}-${day}`;
+}
+
+function calculateInclusiveDays(startAt, endAt) {
+  const startKey = toDayKeyInTimeZone(startAt);
+  const endKey = toDayKeyInTimeZone(endAt);
+
+  if (!startKey || !endKey) return null;
+
+  const startDate = new Date(`${startKey}T00:00:00Z`);
+  const endDate = new Date(`${endKey}T00:00:00Z`);
+  const diffDays = Math.round((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24));
+
+  return Math.max(1, diffDays + 1);
+}
+
 async function safeRows(query, params, label) {
   try {
     const result = await db.executeQuery(query, params);
@@ -1014,9 +1050,9 @@ exports.getMyShelf = async (req, res) => {
         total_pages: Number(row.total_pages || 0),
         status: String(row.history_status || 'finished'),
         days_read: row.started_at && row.finished_at
-          ? Math.max(1, Math.floor((new Date(row.finished_at) - new Date(row.started_at)) / (1000 * 60 * 60 * 24)))
+          ? calculateInclusiveDays(row.started_at, row.finished_at)
           : row.borrowed_at && row.returned_at
-            ? Math.max(1, Math.floor((new Date(row.returned_at) - new Date(row.borrowed_at)) / (1000 * 60 * 60 * 24)))
+            ? calculateInclusiveDays(row.borrowed_at, row.returned_at)
             : null,
       }));
 
@@ -1074,7 +1110,10 @@ exports.joinQueue = async (req, res) => {
     const book = bookRows[0];
     const available = Number(book.available || 0);
     if (available > 0) {
-      return res.status(409).json({ success: false, message: 'Book is available right now. Borrow directly instead of queueing.' });
+      const queueCount = await getQueueCount(bookId);
+      if (queueCount === 0) {
+        return res.status(409).json({ success: false, message: 'Book is available right now. Borrow directly instead of queueing.' });
+      }
     }
 
     const existingLoan = await getActiveLoan(actorUserId, bookId);

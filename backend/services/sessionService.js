@@ -19,8 +19,6 @@ async function revokeSessionsByIds(pool, ids) {
 async function createSession(req, firebase_uid) {
   const pool = getPool();
 
-  // PRIMARY: Use persistent device_id from frontend (sent by AuthProvider)
-  // This is the new reliable identifier for session matching
   const clientProvidedDeviceId = req.body?.device_id;
 
   let device_name, browser, os;
@@ -38,11 +36,7 @@ async function createSession(req, firebase_uid) {
   const clientOs = normalizeClientValue(req.body?.os);
   const clientDeviceName = normalizeClientValue(req.body?.device_name);
 
-  const uaString =
-  req.get("User-Agent") ||
-  req.headers["user-agent"] ||
-  "Unknown";
-
+  const uaString = req.get("User-Agent") || req.headers["user-agent"] || "Unknown";
   const parser = new UAParser(uaString);
   const result = parser.getResult();
 
@@ -51,11 +45,7 @@ async function createSession(req, firebase_uid) {
 
   browser = parsedBrowser || clientBrowser || "Unknown";
   os = parsedOs || clientOs || "Unknown";
-
   device_name = clientDeviceName || `${browser} on ${os}`;
-
-
-
 
   const rawForwardedFor = req.headers["x-forwarded-for"];
   const forwardedIp = Array.isArray(rawForwardedFor)
@@ -63,8 +53,6 @@ async function createSession(req, firebase_uid) {
     : String(rawForwardedFor || '').split(',')[0].trim();
   const ip = forwardedIp || req.headers["x-real-ip"] || req.socket.remoteAddress;
 
-  // PRIMARY MATCHING: firebase_uid + device_id (most reliable, persistent)
-  // New clients send device_id from localStorage - this is the preferred matching path
   if (clientProvidedDeviceId) {
     const checkQuery = `
       SELECT id FROM active_sessions
@@ -74,20 +62,14 @@ async function createSession(req, firebase_uid) {
       ORDER BY last_active DESC;
     `;
 
-    const checkResult = await pool.query(checkQuery, [
-      firebase_uid,
-      clientProvidedDeviceId,
-    ]);
+    const checkResult = await pool.query(checkQuery, [firebase_uid, clientProvidedDeviceId]);
 
-    // If session exists with same device_id, just update last_active
     if (checkResult.rows.length > 0) {
       const keepSessionId = checkResult.rows[0].id;
       const duplicateIds = checkResult.rows.slice(1).map((row) => row.id);
       await revokeSessionsByIds(pool, duplicateIds);
 
-      console.log(
-        `[createSession] 🎯 Matched device_id, updating session_id=${keepSessionId}`
-      );
+      console.log(`[createSession] 🎯 Matched device_id, updating session_id=${keepSessionId}`);
 
       const updateQuery = `
         UPDATE active_sessions
@@ -112,8 +94,6 @@ async function createSession(req, firebase_uid) {
     }
   }
 
-  // SECONDARY MATCHING: firebase_uid + browser + os + ip (fallback for legacy clients)
-  // This path handles old clients or cases where device_id is not available
   if (browser && os) {
     const checkQuery = `
       SELECT id FROM active_sessions
@@ -125,22 +105,14 @@ async function createSession(req, firebase_uid) {
       ORDER BY last_active DESC;
     `;
 
-    const checkResult = await pool.query(checkQuery, [
-      firebase_uid,
-      browser,
-      os,
-      ip,
-    ]);
+    const checkResult = await pool.query(checkQuery, [firebase_uid, browser, os, ip]);
 
-    // If session exists on same device (by browser/os/ip), just update last_active
     if (checkResult.rows.length > 0) {
       const keepSessionId = checkResult.rows[0].id;
       const duplicateIds = checkResult.rows.slice(1).map((row) => row.id);
       await revokeSessionsByIds(pool, duplicateIds);
 
-      console.log(
-        `[createSession] ⏮️ Matched browser/os/ip, updating session_id=${keepSessionId}`
-      );
+      console.log(`[createSession] ⏮️ Matched browser/os/ip, updating session_id=${keepSessionId}`);
 
       const updateQuery = `
         UPDATE active_sessions
@@ -165,7 +137,6 @@ async function createSession(req, firebase_uid) {
     }
   }
 
-  // Enforce max active sessions per user before inserting a brand-new device session.
   const activeSessionsResult = await pool.query(
     `
       SELECT id
@@ -181,15 +152,10 @@ async function createSession(req, firebase_uid) {
     const revokeCount = activeSessionsResult.rows.length - MAX_ACTIVE_SESSIONS + 1;
     const idsToRevoke = activeSessionsResult.rows.slice(0, revokeCount).map((row) => row.id);
     await revokeSessionsByIds(pool, idsToRevoke);
-    console.log(
-      `[createSession] 🚫 Session limit reached. Revoked ${idsToRevoke.length} oldest session(s) for uid=${firebase_uid}`
-    );
+    console.log(`[createSession] 🚫 Session limit reached. Revoked ${idsToRevoke.length} oldest session(s) for uid=${firebase_uid}`);
   }
 
-  // NO MATCH FOUND: Create new session
-  console.log(
-    `[createSession] ✨ New session for firebase_uid=${firebase_uid}, device_id=${clientProvidedDeviceId || 'null'}`
-  );
+  console.log(`[createSession] ✨ New session for firebase_uid=${firebase_uid}, device_id=${clientProvidedDeviceId || 'null'}`);
 
   const insertQuery = `
     INSERT INTO active_sessions
@@ -198,20 +164,12 @@ async function createSession(req, firebase_uid) {
     RETURNING *;
   `;
 
-  const values = [
-    firebase_uid,
-    clientProvidedDeviceId,
-    device_name,
-    browser,
-    os,
-    ip,
-  ];
-
+  const values = [firebase_uid, clientProvidedDeviceId, device_name, browser, os, ip];
   const insertResult = await pool.query(insertQuery, values);
 
   return insertResult.rows[0];
 }
 
 module.exports = {
-    createSession
+  createSession,
 };

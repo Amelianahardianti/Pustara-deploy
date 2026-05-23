@@ -170,6 +170,37 @@ function buildPublicIdentity(userLike) {
   };
 }
 
+function buildAvatarProxyUrl(userId, hasAvatar) {
+  if (!hasAvatar || !userId) return null;
+  return `/users/${encodeURIComponent(String(userId))}/avatar`;
+}
+
+const AVATAR_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const AVATAR_CACHE_MAX_ITEMS = 250;
+const avatarProxyCache = new Map();
+
+function getAvatarCacheKey(userId, avatarUrl) {
+  return `${String(userId)}:${String(avatarUrl)}`;
+}
+
+function readAvatarCache(key) {
+  const cached = avatarProxyCache.get(key);
+  if (!cached) return null;
+  if (Date.now() - cached.createdAt > AVATAR_CACHE_TTL_MS) {
+    avatarProxyCache.delete(key);
+    return null;
+  }
+  return cached;
+}
+
+function writeAvatarCache(key, value) {
+  if (avatarProxyCache.size >= AVATAR_CACHE_MAX_ITEMS) {
+    const oldestKey = avatarProxyCache.keys().next().value;
+    if (oldestKey) avatarProxyCache.delete(oldestKey);
+  }
+  avatarProxyCache.set(key, { ...value, createdAt: Date.now() });
+}
+
 const STREAK_TIME_ZONE = 'Asia/Jakarta';
 const STREAK_DAY_FORMATTER = new Intl.DateTimeFormat('en-US', {
   timeZone: STREAK_TIME_ZONE,
@@ -401,12 +432,14 @@ async function getUserDisplaySummary(userId) {
 function mapUserCard(user, isFollowing = false) {
   return {
     id: String(user.id),
+    firebase_uid: user.firebase_uid ? String(user.firebase_uid) : null,
     ...buildPublicIdentity(user),
     bio: user.bio || '',
-    avatar_url: user.avatar_url || null,
+    avatar_url: buildAvatarProxyUrl(user.id, user.avatar_url),
     preferred_genres: parseStringArray(user.preferred_genres),
     followers_count: Number(user.followers_count || 0),
     total_read: Number(user.total_read || 0),
+    reviews_written: Number(user.reviews_written || 0),
     reading_streak: Number(user.reading_streak || 0),
     is_following: Boolean(isFollowing),
   };
@@ -733,7 +766,7 @@ async function buildUserProfile(targetUserId, actorId = null, userUid = null) {
     name: identity.name,
     email: user.email || null,
     bio: user.bio || '',
-    avatar_url: user.avatar_url || null,
+    avatar_url: buildAvatarProxyUrl(user.id, user.avatar_url),
     preferred_genres: parseStringArray(user.preferred_genres),
     total_read: resolvedTotalRead,
     reading_streak: resolvedStreak,
@@ -769,7 +802,7 @@ exports.getUserProfile = async (req, res) => {
     if (!actorId && req.user?.uid) {
       console.warn(
         '[getUserProfile] WARNING: resolveActorUserId returned null for authenticated user. ' +
-        'firebase_uid:', req.user.uid, 
+        'firebase_uid:', req.user.uid,
         'Will use firebase_uid fallback in buildUserProfile.'
       );
     }
@@ -968,6 +1001,64 @@ exports.updateMyProfile = async (req, res) => {
   }
 };
 
+exports.getUserAvatar = async (req, res) => {
+  try {
+    const userId = String(req.params.id || '').trim();
+    if (!userId) {
+      return res.status(400).json({ success: false, message: 'User ID is required' });
+    }
+
+    const rows = toRows(
+      await db.executeQuery(
+        'SELECT avatar_url FROM users WHERE id = $1 LIMIT 1',
+        [userId]
+      )
+    );
+
+    const avatarUrl = rows[0]?.avatar_url ? String(rows[0].avatar_url).trim() : '';
+    if (!avatarUrl) {
+      return res.status(404).json({ success: false, message: 'Avatar not found' });
+    }
+
+    const cacheKey = getAvatarCacheKey(userId, avatarUrl);
+    const cached = readAvatarCache(cacheKey);
+    if (cached) {
+      res.setHeader('Content-Type', cached.contentType);
+      res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
+      res.setHeader('ETag', cached.etag);
+      if (req.headers['if-none-match'] === cached.etag) {
+        return res.status(304).end();
+      }
+      return res.status(200).send(cached.buffer);
+    }
+
+    const response = await fetch(avatarUrl, {
+      headers: {
+        'User-Agent': 'PustaraAvatarProxy/1.0',
+      },
+    });
+
+    if (!response.ok || !response.body) {
+      return res.status(502).json({ success: false, message: 'Failed to fetch avatar' });
+    }
+
+    const contentType = response.headers.get('content-type') || 'image/jpeg';
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    const etag = `"avatar-${userId}-${buffer.length}-${Date.now()}"`;
+    writeAvatarCache(cacheKey, { buffer, contentType, etag });
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
+    res.setHeader('ETag', etag);
+
+    return res.status(200).send(buffer);
+  } catch (error) {
+    console.error('Error serving avatar proxy:', error.message);
+    return res.status(500).json({ success: false, message: 'Failed to serve avatar' });
+  }
+};
+
 exports.followUser = async (req, res) => {
   try {
     const { id } = req.params;
@@ -1149,8 +1240,9 @@ exports.getRecommendedUsers = async (req, res) => {
 
     const recommendationRows = toRows(
       await db.executeQuery(
-        `SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.preferred_genres,
-                u.total_read, u.reading_streak,
+      `SELECT u.id, u.firebase_uid, u.username, u.display_name, u.bio, u.avatar_url, u.preferred_genres,
+        u.total_read, u.reading_streak,
+        (SELECT COUNT(*) FROM reviews r WHERE r.user_id = u.id) AS reviews_written,
                 (SELECT COUNT(*) FROM follows f WHERE f.following_id = u.id) AS followers_count
          FROM users u
          ${whereClause}
@@ -1168,7 +1260,9 @@ exports.getRecommendedUsers = async (req, res) => {
       preferred_genres: parseStringArray(user.preferred_genres),
       followers_count: Number(user.followers_count || 0),
       total_read: Number(user.total_read || 0),
+      reviews_written: Number(user.reviews_written || 0),
       reading_streak: Number(user.reading_streak || 0),
+      firebase_uid: user.firebase_uid ? String(user.firebase_uid) : null,
       is_following: false,
     }));
 
@@ -1247,8 +1341,9 @@ exports.getMyFollowing = async (req, res) => {
 
     const rows = toRows(
       await db.executeQuery(
-        `SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.preferred_genres,
-                u.total_read, u.reading_streak,
+      `SELECT u.id, u.firebase_uid, u.username, u.display_name, u.bio, u.avatar_url, u.preferred_genres,
+        u.total_read, u.reading_streak,
+        (SELECT COUNT(*) FROM reviews r WHERE r.user_id = u.id) AS reviews_written,
                 (SELECT COUNT(*) FROM follows f2 WHERE f2.following_id = u.id) AS followers_count
          FROM follows f
          JOIN users u ON u.id = f.following_id
@@ -1283,8 +1378,9 @@ exports.getMyFollowers = async (req, res) => {
 
     const rows = toRows(
       await db.executeQuery(
-        `SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.preferred_genres,
-                u.total_read, u.reading_streak,
+      `SELECT u.id, u.firebase_uid, u.username, u.display_name, u.bio, u.avatar_url, u.preferred_genres,
+        u.total_read, u.reading_streak,
+        (SELECT COUNT(*) FROM reviews r WHERE r.user_id = u.id) AS reviews_written,
                 (SELECT COUNT(*) FROM follows f2 WHERE f2.following_id = u.id) AS followers_count
          FROM follows f
          JOIN users u ON u.id = f.follower_id

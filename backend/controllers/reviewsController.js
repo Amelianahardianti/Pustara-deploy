@@ -47,7 +47,8 @@ exports.getRecentReviews = async (req, res) => {
 
     // Privacy: Only show reviews where user has public_reviews=true OR viewing user is the owner
     const sql = `SELECT r.id AS review_id, r.*,
-        COALESCE(u.username, u.display_name) AS username,
+      u.firebase_uid,
+      COALESCE(u.username, u.display_name) AS username,
         u.display_name,
         u.avatar_url,
         u.id AS user_id,
@@ -87,6 +88,7 @@ exports.getRecentReviews = async (req, res) => {
       const authors = row.authors ?? row.book_authors ?? null;
       return {
         review_id: String(row.review_id || row.id || ''),
+        firebase_uid: row.firebase_uid ? String(row.firebase_uid) : null,
         // display_name is the human-facing name shown on cards
         // Fall back to COALESCE username, then raw name field
         user: String(row.display_name || row.username || row.name || ''),
