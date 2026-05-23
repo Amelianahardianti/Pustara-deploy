@@ -371,6 +371,7 @@ exports.getBookReviews = async (req, res) => {
         r.review_text as body,
         r.review_text as review_text,
         r.created_at as time,
+        u.username as username,
         COALESCE(u.display_name, u.username) as name,
         u.avatar_url,
         COALESCE(u.display_name, u.username, 'U') as avatar,

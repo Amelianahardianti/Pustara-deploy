@@ -307,44 +307,51 @@ exports.getMyNotifications = async (req, res) => {
     const queryVariants = [
       {
         sql: `SELECT
-               id, user_id, type, title,
-               body, NULL AS message,
-               book_id, NULL AS related_book_id,
-               actor_id, NULL AS related_user_id,
-               read, NULL AS is_read,
-               created_at
-             FROM notifications
-             WHERE user_id = $1
-             ORDER BY created_at DESC
+               n.id, n.user_id, n.type, n.title,
+               n.body, NULL AS message,
+               n.book_id, NULL AS related_book_id,
+               n.actor_id,
+               u.username AS actor_username,
+               n.read, NULL AS is_read,
+               n.created_at
+             FROM notifications n
+             LEFT JOIN users u ON u.id = n.actor_id
+             WHERE n.user_id = $1
+             ORDER BY n.created_at DESC
              LIMIT $2`,
         params: [actorUserId, limit],
       },
       {
         sql: `SELECT
-               id, user_id, type, title,
-               NULL AS body, message,
-               book_id, NULL AS related_book_id,
-               actor_id, NULL AS related_user_id,
-               NULL AS read, is_read,
-               created_at
-             FROM notifications
-             WHERE user_id = $1
-             ORDER BY created_at DESC
+               n.id, n.user_id, n.type, n.title,
+               NULL AS body, n.message,
+               n.book_id, NULL AS related_book_id,
+               n.actor_id,
+               u.username AS actor_username,
+               NULL AS read, n.is_read,
+               n.created_at
+             FROM notifications n
+             LEFT JOIN users u ON u.id = n.actor_id
+             WHERE n.user_id = $1
+             ORDER BY n.created_at DESC
              LIMIT $2`,
         params: [actorUserId, limit],
       },
       {
-        sql: `SELECT TOP 100
-               id, user_id, type, title,
-               body, NULL AS message,
-               book_id, NULL AS related_book_id,
-               actor_id, NULL AS related_user_id,
-               read, NULL AS is_read,
-               created_at
-             FROM notifications
-             WHERE user_id = $1
-             ORDER BY created_at DESC`,
-        params: [actorUserId],
+        sql: `SELECT
+               n.id, n.user_id, n.type, n.title,
+               n.body, NULL AS message,
+               n.book_id, NULL AS related_book_id,
+               n.actor_id,
+               u.username AS actor_username,
+               n.read, NULL AS is_read,
+               n.created_at
+             FROM notifications n
+             LEFT JOIN users u ON u.id = n.actor_id
+             WHERE n.user_id = $1
+             ORDER BY n.created_at DESC
+             LIMIT $2`,
+        params: [actorUserId, limit],
       },
     ];
 
@@ -367,11 +374,12 @@ exports.getMyNotifications = async (req, res) => {
       title: String(row.title || ''),
       body: String(row.body || row.message || ''),
       description: String(row.body || row.message || ''),
-      actor_id: row.actor_id ? String(row.actor_id) : row.related_user_id ? String(row.related_user_id) : null,
+      actor_id: row.actor_id ? String(row.actor_id) : null,
       book_id: row.book_id ? String(row.book_id) : row.related_book_id ? String(row.related_book_id) : null,
-      related_user_id: row.related_user_id ? String(row.related_user_id) : row.actor_id ? String(row.actor_id) : null,
+      related_user_id: null,
       related_book_id: row.related_book_id ? String(row.related_book_id) : row.book_id ? String(row.book_id) : null,
       read: Boolean(row.read ?? row.is_read),
+      actor_username: row.actor_username ? String(row.actor_username) : null,
       is_read: Boolean(row.is_read ?? row.read),
       created_at: row.created_at || null,
       timestamp: row.created_at || null,

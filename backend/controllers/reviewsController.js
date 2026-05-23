@@ -92,6 +92,7 @@ exports.getRecentReviews = async (req, res) => {
         // display_name is the human-facing name shown on cards
         // Fall back to COALESCE username, then raw name field
         user: String(row.display_name || row.username || row.name || ''),
+        username: row.username ? String(row.username) : null,
         avatar_url: row.avatar_url || row.user_avatar || null,
         rating: Number(row.rating ?? 0),
         book: String(row.book_title || row.book_title_raw || ''),
