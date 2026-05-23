@@ -863,6 +863,7 @@ exports.getBookDetail = async (req, res) => {
       });
     }
 
+    const normalizedBook = normalizeBookRow(rows[0]);
     const queueCount = await getQueueCountByBookId(id);
     const book = {
       ...withDownloadUrl(normalizedBook, req),
