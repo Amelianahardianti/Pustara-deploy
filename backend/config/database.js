@@ -16,9 +16,18 @@ async function initNeon() {
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.NODE_ENV === 'dummy' ? false : { rejectUnauthorized: false },
   });
+
+  // Force every connection to use the public schema.
+  // Neon sometimes resets the default search_path, causing "relation does not exist".
+  pgPool.on('connect', (client) => {
+    client.query('SET search_path TO public').catch((err) => {
+      console.warn('[DB] Failed to set search_path:', err.message);
+    });
+  });
   
   // Test connection
   const client = await pgPool.connect();
+  await client.query('SET search_path TO public');
   client.release();
   console.log('✅ Neon PostgreSQL connected (Production Cloud)');
   return pgPool;
@@ -85,8 +94,11 @@ async function ensureNeonShelfSchemaCompatibility() {
   const safeStatements = [
     "ALTER TABLE IF EXISTS wishlist ADD COLUMN IF NOT EXISTS added_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP",
     "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS borrowed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP",
+    "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS due_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP + INTERVAL '7 days'",
     "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS due_date TIMESTAMPTZ",
     "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS returned_at TIMESTAMPTZ",
+    "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS extended BOOLEAN DEFAULT false",
+    "ALTER TABLE IF EXISTS loans ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS status TEXT",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ",
@@ -94,6 +106,33 @@ async function ensureNeonShelfSchemaCompatibility() {
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS progress_percentage NUMERIC DEFAULT 0",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS current_page INTEGER DEFAULT 0",
     "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS total_pages INTEGER DEFAULT 0",
+    "ALTER TABLE IF EXISTS reading_sessions ADD COLUMN IF NOT EXISTS reading_time_minutes INTEGER DEFAULT 0",
+    "CREATE TABLE IF NOT EXISTS login_events (id BIGSERIAL PRIMARY KEY, firebase_uid TEXT NOT NULL, login_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)",
+    "ALTER TABLE IF EXISTS notifications ADD COLUMN IF NOT EXISTS body TEXT",
+    "ALTER TABLE IF EXISTS notifications ADD COLUMN IF NOT EXISTS book_id UUID",
+    "ALTER TABLE IF EXISTS notifications ADD COLUMN IF NOT EXISTS actor_id UUID",
+    "ALTER TABLE IF EXISTS notifications ADD COLUMN IF NOT EXISTS read BOOLEAN DEFAULT false",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active'",
+    "CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS activity_visible BOOLEAN DEFAULT true",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS public_reading_list BOOLEAN DEFAULT true",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS public_reviews BOOLEAN DEFAULT true",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS public_followers BOOLEAN DEFAULT true",
+    `CREATE TABLE IF NOT EXISTS review_reports (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      review_id UUID NOT NULL,
+      reporter_id UUID,
+      reason VARCHAR(100) DEFAULT 'Spam',
+      status VARCHAR(50) DEFAULT 'pending',
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+      resolved_at TIMESTAMPTZ
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_review_reports_status ON review_reports(status)`,
+    "ALTER TABLE IF EXISTS reviews ADD COLUMN IF NOT EXISTS review_text TEXT",
+    "UPDATE reviews SET review_text = body WHERE review_text IS NULL AND body IS NOT NULL",
+    "ALTER TABLE IF EXISTS reviews ADD COLUMN IF NOT EXISTS body TEXT",
+    "UPDATE reviews SET body = review_text WHERE body IS NULL AND review_text IS NOT NULL",
+    "ALTER TABLE IF EXISTS reviews ADD COLUMN IF NOT EXISTS likes INTEGER DEFAULT 0",
   ];
 
   for (const statement of safeStatements) {
@@ -131,6 +170,17 @@ async function ensureNeonShelfSchemaCompatibility() {
      BEGIN
        IF EXISTS (
          SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'loans' AND column_name = 'due_date'
+       ) THEN
+         UPDATE loans
+         SET due_at = COALESCE(due_at, due_date)
+         WHERE due_at IS NULL;
+       END IF;
+     END $$;`,
+    `DO $$
+     BEGIN
+       IF EXISTS (
+         SELECT 1 FROM information_schema.columns
          WHERE table_schema = 'public' AND table_name = 'loans' AND column_name = 'created_at'
        ) THEN
          UPDATE loans
@@ -138,7 +188,42 @@ async function ensureNeonShelfSchemaCompatibility() {
          WHERE borrowed_at IS NULL;
        END IF;
      END $$;`,
+    `DO $$
+     BEGIN
+       IF EXISTS (
+         SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'reading_sessions' AND column_name = 'start_time'
+       ) THEN
+         UPDATE reading_sessions
+         SET started_at = COALESCE(started_at, start_time)
+         WHERE started_at IS NULL;
+       END IF;
+     END $$;`,
+    `DO $$
+     BEGIN
+       IF EXISTS (
+         SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'reading_sessions' AND column_name = 'pages_read'
+       ) THEN
+         UPDATE reading_sessions
+         SET current_page = COALESCE(current_page, pages_read)
+         WHERE current_page IS NULL OR current_page = 0;
+       END IF;
+     END $$;`,
+    `DO $$
+     BEGIN
+       IF EXISTS (
+         SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'reading_sessions' AND column_name = 'duration_minutes'
+       ) THEN
+         UPDATE reading_sessions
+         SET reading_time_minutes = COALESCE(reading_time_minutes, duration_minutes)
+         WHERE reading_time_minutes IS NULL OR reading_time_minutes = 0;
+       END IF;
+     END $$;`,
     `UPDATE reading_sessions SET status = COALESCE(status, 'reading') WHERE status IS NULL`,
+    `UPDATE notifications SET body = COALESCE(body, message) WHERE body IS NULL`,
+    `UPDATE notifications SET read = COALESCE(read, is_read, false) WHERE read IS NULL`,
   ];
 
   for (const statement of backfillBlocks) {
@@ -162,8 +247,7 @@ async function executeQuery(query, params = []) {
   if (isNeon) {
     if (!pgPool) throw new Error('Neon DB not initialized. Call initializeDatabase() first');
     const result = await pgPool.query(query, params);
-    // Return in same format as Azure for compatibility
-    return { rows: result.rows };
+    return result.rows;
   }
 
   // Azure SQL logic
@@ -210,11 +294,11 @@ async function executeQuery(query, params = []) {
   // 4. Convert ILIKE to LIKE for case-insensitive search
   azureQuery = azureQuery.replace(/\bILIKE\b/gi, 'LIKE');
   
-  const azureResult = await request.query(azureQuery);
+  const result = await request.query(azureQuery);
   
   // Return in same format as pg library for compatibility
   // Controllers expect result.rows, but mssql uses result.recordset
-  return { rows: azureResult.recordset };
+  return { rows: result.recordset };
 }
 
 /**
@@ -248,17 +332,86 @@ async function createUsersTable() {
           email NVARCHAR(255) UNIQUE NOT NULL,
           displayName NVARCHAR(255),
           photoURL NVARCHAR(MAX),
+          role NVARCHAR(50) DEFAULT 'reader',
+          status NVARCHAR(50) DEFAULT 'active',
           createdAt DATETIME DEFAULT GETDATE(),
           updatedAt DATETIME DEFAULT GETDATE()
         );
         CREATE INDEX idx_email ON Users(email);
         CREATE INDEX idx_uid ON Users(uid);
+        CREATE INDEX idx_role ON Users(role);
         PRINT 'Users table created';
+      END
+      ELSE
+      BEGIN
+        IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'Users' AND COLUMN_NAME = 'role')
+        BEGIN
+          ALTER TABLE Users ADD role NVARCHAR(50) DEFAULT 'reader';
+          CREATE INDEX idx_role ON Users(role);
+          PRINT 'Added role column to Users table';
+        END
+
+        IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'Users' AND COLUMN_NAME = 'status')
+        BEGIN
+          ALTER TABLE Users ADD status NVARCHAR(50) DEFAULT 'active';
+          CREATE INDEX idx_status ON Users(status);
+          PRINT 'Added status column to Users table';
+        END
       END
     `);
     console.log('✅ Users table ready');
   } catch (error) {
     console.error('❌ Error creating users table:', error);
+    throw error;
+  }
+}
+
+/**
+ * Neon-only users schema compatibility patcher.
+ * Adds admin-facing fields that may be missing from older deployments.
+ */
+async function ensureNeonUsersSchemaCompatibility() {
+  if (!isNeon) return;
+  if (!pgPool) throw new Error('Neon DB not initialized. Call initializeDatabase() first');
+
+  const statements = [
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active'",
+    "CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)",
+  ];
+
+  for (const statement of statements) {
+    try {
+      await pgPool.query(statement);
+    } catch (error) {
+      console.warn(`⚠️  Users schema compatibility statement skipped: ${error.message}`);
+    }
+  }
+}
+
+async function createLoginEventsTable() {
+  if (isNeon) {
+    console.log('✅ Login events table — auto-create di-skip untuk Neon (pakai schema/runtime)');
+    return;
+  }
+
+  try {
+    const pool = getPool();
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'login_events')
+      BEGIN
+        CREATE TABLE login_events (
+          id INT PRIMARY KEY IDENTITY(1,1),
+          firebase_uid NVARCHAR(255) NOT NULL,
+          login_at DATETIME2 DEFAULT GETDATE()
+        );
+        CREATE INDEX idx_login_events_firebase_uid ON login_events(firebase_uid);
+        CREATE INDEX idx_login_events_login_at ON login_events(login_at);
+        PRINT 'login_events table created';
+      END
+    `);
+    console.log('✅ login_events table ready');
+  } catch (error) {
+    console.error('❌ Error creating login_events table:', error);
     throw error;
   }
 }
@@ -310,9 +463,11 @@ async function closeDatabase() {
 module.exports = {
   initializeDatabase,
   ensureNeonShelfSchemaCompatibility,
+  ensureNeonUsersSchemaCompatibility,
   executeQuery,
   getPool,
   createUsersTable,
+  createLoginEventsTable,
   createUserSurveyTable,
   closeDatabase,
   isNeon,

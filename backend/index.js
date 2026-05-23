@@ -11,20 +11,12 @@
  * - routes/     : API routes
  */
 
-console.log('[STARTUP]', new Date().toISOString(), 'index.js loaded');
-const fs = require('fs');
-fs.writeFileSync('./debug-requests.log', `[${new Date().toISOString()}] === BACKEND STARTED ===\n`);
-
-// Log that we're about to define the "app" routes
-fs.appendFileSync('./debug-requests.log', `[${new Date().toISOString()}] Defining app routes...\n`);
-
 // CRITICAL: Polyfill global crypto for @typespec/ts-http-runtime
 if (typeof global.crypto === 'undefined') {
   global.crypto = require('crypto').webcrypto;
 }
 
-const path = require('path');
-require("dotenv").config({ path: path.join(__dirname, '.env') });
+require("dotenv").config();
 
 const nodeEnv = (process.env.NODE_ENV || '').toLowerCase();
 const isNeonMode = nodeEnv === 'neon' || process.env.NEON_CLOUD_MODE === 'true';
@@ -42,20 +34,23 @@ const CONFIG = require("./constants/config");
 const FirebaseProvider = require("./providers/firebaseProvider");
 const AuthService = require("./services/authService");
 const { createVerifyTokenMiddleware, createOptionalVerifyTokenMiddleware } = require("./middleware/auth");
+const { createCheckActiveSessionMiddleware } = require("./middleware/checkActiveSession");
 const { authorizeAdmin } = require("./middleware/adminAuth");
 const { createAuthRoutes } = require("./routes/auth");
 const createSurveyRoutes = require("./routes/survey");
-const { initializeDatabase, ensureNeonShelfSchemaCompatibility, createUsersTable, createUserSurveyTable } = require("./config/database");
+const { initializeDatabase, ensureNeonShelfSchemaCompatibility, ensureNeonUsersSchemaCompatibility, createLoginEventsTable, createUsersTable, createUserSurveyTable } = require("./config/database");
 
 // Routes
 const createRecommendationsRoutes = require('./routes/recommendations');
 const booksRoutes = require('./routes/booksRoutes');
 const booksAdminRoutes = require('./routes/booksAdminRoutes');
+const adminRoutes = require('./routes/adminRoutes');
 const readingSessionRoutes = require('./routes/readingSessionRoutes');
 const analyticsRoutes = require('./routes/analyticsRoutes');
 const userRoutes = require('./routes/userRoutes');
 const shelfRoutes = require('./routes/shelfRoutes');
 const feedRoutes = require('./routes/feedRoutes');
+const reviewsRoutes = require('./routes/reviewsRoutes');
 
 require('./jobs/cron'); //init cron jobs for ai-related tasks
 
@@ -63,20 +58,11 @@ require('./jobs/cron'); //init cron jobs for ai-related tasks
 // INITIALIZE
 // ==========================================
 const app = express();
-const fsDebug = require('fs');
-fsDebug.appendFileSync('./debug-requests.log', `[${new Date().toISOString()}] app = express() created\n`);
 
-// CORS setup
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
-  next();
-});
+// NOTE: Use the `cors` middleware below to handle preflight and origin reflection.
+// Avoid setting Access-Control-Allow-* headers manually here because it may
+// conflict with `cors` and return a wildcard origin while also allowing
+// credentials, which browsers will reject during preflight.
 
 // Middleware
 app.use(express.json());
@@ -87,24 +73,44 @@ app.use(fileUpload({
   useTempFiles: true,
   tempFileDir: '/tmp/',
 }));
+// Use a dynamic origin checker so the cors middleware will reflect the
+// actual requesting Origin when credentials are allowed. Also include
+// custom device headers used by the frontend (x-device-id, etc.) so
+// preflight responses include them in Access-Control-Allow-Headers.
 app.use(cors({
-  origin: CONFIG.CORS_ORIGINS || "http://localhost:3001",
-  methods: ["GET", "POST", "PUT", "DELETE"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile/native or curl)
+    if (!origin) return callback(null, true);
+    try {
+      const allowed = Array.isArray(CONFIG.CORS_ORIGINS)
+        ? CONFIG.CORS_ORIGINS
+        : [CONFIG.CORS_ORIGINS];
+      if (allowed.indexOf(origin) !== -1) return callback(null, true);
+    } catch (e) {
+      // fallback: deny
+    }
+    return callback(new Error('Not allowed by CORS'));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-Requested-With",
+    "x-device-id",
+    "x-device-name",
+    "x-device-os",
+    "x-device-browser",
+  ],
   credentials: true,
+  optionsSuccessStatus: 200,
 }));
-
-// DEBUG: Log all requests
-app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] 📍 ${req.method} ${req.path}`);
-  next();
-});
 
 // Setup Auth
 const authProvider = new FirebaseProvider();
 const authService = new AuthService(authProvider);
 const verifyTokenMiddleware = createVerifyTokenMiddleware(authService);
 const optionalVerifyTokenMiddleware = createOptionalVerifyTokenMiddleware(authService);
+const checkActiveSessionMiddleware = createCheckActiveSessionMiddleware();
 
 // ==========================================
 // ROUTES
@@ -112,27 +118,11 @@ const optionalVerifyTokenMiddleware = createOptionalVerifyTokenMiddleware(authSe
 
 // Health Check
 app.get("/", (req, res) => {
-  require('fs').appendFileSync('./debug-requests.log', `[${new Date().toISOString()}] GET / hit\n`);
   res.json({ message: "Pustara API ready", status: "healthy" });
 });
 
-// TEST GET - verify app.get works
-app.get("/test-get", (req, res) => {
-  const fs = require('fs');
-  fs.appendFileSync('./debug-requests.log', `[${new Date().toISOString()}] GET /test-get hit\n`);
-  console.log('✅ GET /test-get reached!');
-  res.json({ success: true, msg: "GET works" });
-});
-require('fs').appendFileSync('./debug-requests.log', `[${new Date().toISOString()}] app.get("/test-get") REGISTERED\n`);
-
-// TEST - Different path
-app.post("/test-endpoint", (req, res) => {
-  console.log('🎯 POST /test-endpoint reached!');
-  res.json({ success: true, msg: "test-endpoint works" });
-});
-
 // Auth Routes
-app.use("/auth", createAuthRoutes(authService, verifyTokenMiddleware));
+app.use("/auth", createAuthRoutes(authService, verifyTokenMiddleware, checkActiveSessionMiddleware));
 
 // Survey Routes
 app.use("/survey", createSurveyRoutes(verifyTokenMiddleware));
@@ -142,28 +132,39 @@ app.get("/api/protected", verifyTokenMiddleware, (req, res) => {
   res.json({ message: "Protected data", user: req.user });
 });
 
-// PROTECTED: Reviews endpoint (requires Firebase auth)
-const booksController = require('./controllers/booksController');
-app.post('/reviews', verifyTokenMiddleware, booksController.createOrUpdateReview);
-
 // Recommendations Routes
 app.use('/recommendations', createRecommendationsRoutes(verifyTokenMiddleware, optionalVerifyTokenMiddleware));
 
-// Books Routes (dengan Azure Blob file handling)
-app.use('/', booksRoutes);
-
 // Books Admin Routes (protected by verifyToken + authorizeAdmin)
 // IMPORTANT: Mount to /admin prefix to avoid catching all / routes
-app.use('/admin/books', verifyTokenMiddleware, authorizeAdmin, booksAdminRoutes);
+// app.use('/', verifyTokenMiddleware, authorizeAdmin, booksAdminRoutes);
+
+app.use('/admin/books', verifyTokenMiddleware, checkActiveSessionMiddleware, authorizeAdmin, booksAdminRoutes);
+
+// Books Routes (public catalog + token-aware protected reader endpoints)
+app.use('/', optionalVerifyTokenMiddleware, booksRoutes);
+
+app.use('/admin', verifyTokenMiddleware, checkActiveSessionMiddleware, authorizeAdmin, adminRoutes);
+
+// User Management Admin Routes (protected by verifyToken + authorizeAdmin)
+// NOTE: Do not mount adminRoutes at root ('/'), it can hijack '/users/*' endpoints
+// such as '/users/username-availability' and incorrectly require admin auth.
+// Keep admin routes under '/admin' only.
 
 // Reading Session Routes (track user reading progress)
-app.use('/reading', verifyTokenMiddleware, readingSessionRoutes);
+app.use('/reading', verifyTokenMiddleware, checkActiveSessionMiddleware, readingSessionRoutes);
 
 // Shelf Routes (loans, reading sessions, wishlist)
-app.use('/shelf', verifyTokenMiddleware, shelfRoutes);
+app.use('/shelf', verifyTokenMiddleware, checkActiveSessionMiddleware, shelfRoutes);
 
 // Feed Routes (activity, notifications, recommendations)
-app.use('/feed', verifyTokenMiddleware, feedRoutes);
+app.use('/feed', verifyTokenMiddleware, checkActiveSessionMiddleware, feedRoutes);
+
+// Public Reviews (recent community reviews for homepage widgets)
+app.use('/reviews', optionalVerifyTokenMiddleware, reviewsRoutes);
+
+// Also mount reviews routes under /community so front-end can request /community/reviews
+app.use('/community', optionalVerifyTokenMiddleware, reviewsRoutes);
 
 // User Social/Profile Routes (allow optional auth for actor-aware responses)
 app.use('/users', optionalVerifyTokenMiddleware, userRoutes);
@@ -190,14 +191,35 @@ async function startServer() {
   
   try {
     console.log("\n⏳ Initializing Database...");
-    console.log(`   NODE_ENV: ${process.env.NODE_ENV}`);
-    console.log(`   DATABASE_URL set: ${!!process.env.DATABASE_URL}`);
-    
     await initializeDatabase();
     try {
       await ensureNeonShelfSchemaCompatibility();
     } catch (schemaError) {
       console.warn(`⚠️  Shelf schema compatibility check skipped: ${schemaError.message}`);
+    }
+    try {
+      await ensureNeonUsersSchemaCompatibility();
+    } catch (schemaError) {
+      console.warn(`⚠️  Users schema compatibility check skipped: ${schemaError.message}`);
+    }
+    try {
+      await createLoginEventsTable();
+    } catch (loginSchemaError) {
+      console.warn(`⚠️  Login events schema check skipped: ${loginSchemaError.message}`);
+    }
+
+    try {
+      const pool = getPool();
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS review_likes (
+          review_id   UUID NOT NULL,
+          user_id     TEXT NOT NULL,
+          created_at  TIMESTAMPTZ DEFAULT now(),
+          PRIMARY KEY (review_id, user_id)
+        )
+      `);
+    } catch (e) {
+      console.warn('⚠️  review_likes table check skipped:', e.message);
     }
     console.log("✅ Database initialized successfully\n");
     
@@ -205,10 +227,9 @@ async function startServer() {
     const surveyTableReady = await createUserSurveyTable();
     dbConnected = true;
   } catch (dbError) {
-    console.error("\n❌ Database initialization FAILED:");
-    console.error(`   Error: ${dbError.message}`);
-    console.error(`   Stack: ${dbError.stack}`);
-    console.error("   ⚠️  API endpoints that need database will return 500 errors\n");
+    console.warn("\n⚠️  Database initialization failed (running in offline mode):");
+    console.warn(`   ${dbError.message}`);
+    console.warn("   You can still use the API with limited functionality\n");
   }
   
   // Start server even if DB failed

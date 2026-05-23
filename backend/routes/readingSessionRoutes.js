@@ -10,6 +10,9 @@ const {
   startReadingSession,
   updateReadingProgress,
   finishReadingSession,
+  updateReadingProgressByBook,
+  finishReadingByBook,
+  pauseReadingByBook,
   getUserSessions,
   getSessionDetails,
 } = require('../controllers/readingSessionController');
@@ -41,8 +44,19 @@ router.get('/:sessionId', getSessionDetails);
 // Body: { current_page?, reading_time_minutes?, status? }
 router.put('/update/:sessionId', updateReadingProgress);
 
+// Book-based update reading progress for the current frontend contract
+// POST /reading/update
+// Body: { bookId, currentPage?, readingTimeMinutes?, status? }
+router.post('/update', updateReadingProgressByBook);
+
 // Finish a reading session
 // POST /reading/finish/:sessionId
 router.post('/finish/:sessionId', finishReadingSession);
+
+// Book-based finish reading endpoint
+router.post('/finish', finishReadingByBook);
+
+// Book-based pause reading endpoint
+router.post('/pause', pauseReadingByBook);
 
 module.exports = router;
