@@ -9,6 +9,24 @@ const { v4: uuidv4 } = require('uuid');
 const SUPABASE_PROJECT_URL = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_BUCKET = 'pustara-storage';
 
+async function pipeRemotePdf(response, res) {
+  const { Readable } = require('stream');
+
+  if (!response.body) {
+    const buffer = Buffer.from(await response.arrayBuffer());
+    res.end(buffer);
+    return;
+  }
+
+  if (typeof Readable.fromWeb === 'function') {
+    Readable.fromWeb(response.body).pipe(res);
+    return;
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  res.end(buffer);
+}
+
 function getBackendBaseUrl(req) {
   const forwardedProto = Array.isArray(req.headers['x-forwarded-proto'])
     ? req.headers['x-forwarded-proto'][0]
@@ -322,11 +340,6 @@ exports.downloadBookFile = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Book file not available' });
     }
 
-    const supabasePublicUrl = getSupabasePublicUrl(book.file_url);
-    if (supabasePublicUrl) {
-      return res.redirect(302, supabasePublicUrl);
-    }
-
     // If user authenticated, log reading session (fire and forget)
     if (userId) {
       setImmediate(async () => {
@@ -362,8 +375,24 @@ exports.downloadBookFile = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid file URL' });
     }
 
-    // Stream file from local storage
+    const supabasePublicUrl = getSupabasePublicUrl(book.file_url);
+
     try {
+      if (supabasePublicUrl) {
+        const remoteResponse = await fetch(supabasePublicUrl);
+
+        if (!remoteResponse.ok) {
+          throw new Error(`Remote PDF returned ${remoteResponse.status}`);
+        }
+
+        res.status(remoteResponse.status);
+        res.setHeader('Content-Type', remoteResponse.headers.get('content-type') || book.file_type || 'application/pdf');
+        res.setHeader('Content-Disposition', `inline; filename="${book.title}.pdf"`);
+        await pipeRemotePdf(remoteResponse, res);
+        return;
+      }
+
+      // Stream file from local storage
       const stream = await storage.downloadFile(fileName);
       res.setHeader('Content-Type', book.file_type || 'application/pdf');
       res.setHeader('Content-Disposition', `inline; filename="${book.title}.pdf"`);
@@ -376,6 +405,10 @@ exports.downloadBookFile = async (req, res) => {
     console.error('Error downloading book file:', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
+};
+
+exports.downloadBookFileAdmin = async (req, res) => {
+  return exports.downloadBookFile(req, res);
 };
 
 // POST /books - Admin: Create new book (dengan file upload)
