@@ -38,7 +38,15 @@ const { createCheckActiveSessionMiddleware } = require("./middleware/checkActive
 const { authorizeAdmin } = require("./middleware/adminAuth");
 const { createAuthRoutes } = require("./routes/auth");
 const createSurveyRoutes = require("./routes/survey");
-const { initializeDatabase, ensureNeonShelfSchemaCompatibility, ensureNeonUsersSchemaCompatibility, createLoginEventsTable, createUsersTable, createUserSurveyTable } = require("./config/database");
+const {
+  initializeDatabase,
+  ensureNeonShelfSchemaCompatibility,
+  ensureNeonUsersSchemaCompatibility,
+  createLoginEventsTable,
+  createUsersTable,
+  createUserSurveyTable,
+  getPool
+} = require("./config/database");
 
 // Routes
 const createRecommendationsRoutes = require('./routes/recommendations');
@@ -124,24 +132,6 @@ app.use(cors({
     "X-Total-Count",  // For pagination
     "X-Page-Number",
     "X-Page-Size",
-  ],
-  credentials: true,
-  optionsSuccessStatus: 200,
-}));
-
-// Explicit OPTIONS handler as fallback for preflight requests
-// This ensures OPTIONS requests are always handled even if not matched by any route
-app.options('*', cors({
-  origin: corsOriginCallback,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "X-Requested-With",
-    "x-device-id",
-    "x-device-name",
-    "x-device-os",
-    "x-device-browser",
   ],
   credentials: true,
   optionsSuccessStatus: 200,
