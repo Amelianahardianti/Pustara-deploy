@@ -12,6 +12,7 @@ router.get('/me/followers', userController.getMyFollowers);
 router.get('/privacy-settings', userController.getPrivacySettings);
 router.put('/me', userController.updateMyProfile);
 router.put('/privacy-settings', userController.updatePrivacySettings);
+router.get('/:id/avatar', userController.getUserAvatar);
 router.get('/:id', userController.getUserProfile);
 router.post('/:id/follow', userController.followUser);
 router.delete('/:id/unfollow', userController.unfollowUser);

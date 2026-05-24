@@ -133,7 +133,6 @@ const createCheckActiveSessionMiddleware = () => {
           [session.id]
         );
       }
-
       next();
     } catch (error) {
       console.error("[checkActiveSession] Error:", error.message);

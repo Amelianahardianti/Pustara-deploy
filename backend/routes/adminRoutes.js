@@ -496,9 +496,9 @@ router.get('/reviews', asyncHandler(async (req, res) => {
     SELECT
       r.id           AS review_id,
       r.rating,
-      COALESCE(r.review_text, r.body, r.text, '') AS review_text,
+      COALESCE(r.review_text, r.body, '') AS review_text,
       r.likes,
-      COALESCE(r.created_at, r.created_at_utc) AS created_at,
+      r.created_at AS created_at,
       b.id           AS book_id,
       b.title        AS book_title,
       b.cover_url    AS book_cover_url,
@@ -511,7 +511,7 @@ router.get('/reviews', asyncHandler(async (req, res) => {
     JOIN books b ON b.id = r.book_id
     LEFT JOIN users u ON u.id = r.user_id
     ${whereClause}
-    ORDER BY COALESCE(r.created_at, r.created_at_utc) DESC
+    ORDER BY r.created_at DESC
     LIMIT $${params.length - 1} OFFSET $${params.length}
   `;
 
@@ -602,7 +602,7 @@ router.get('/reports', asyncHandler(async (_req, res) => {
         rr.reason,
         rr.created_at    AS reported_at,
         r.id             AS review_id,
-        COALESCE(r.review_text, r.body, r.text, '') AS review_text,
+        COALESCE(r.review_text, r.body, '') AS review_text,
         r.rating,
         b.id             AS book_id,
         b.title          AS book_title,

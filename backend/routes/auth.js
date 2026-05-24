@@ -214,6 +214,7 @@ function createAuthRoutes(authService, verifyTokenMiddleware, checkActiveSession
   );
 
   // POST /auth/delete-account - Delete current user's account (protected, real auth)
+  // POST /auth/delete-account - Delete user's account (protected + session validated)
   router.post(
     "/delete-account",
     verifyTokenMiddleware,
