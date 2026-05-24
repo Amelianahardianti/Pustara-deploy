@@ -8,9 +8,13 @@ const CONFIG = {
   NODE_ENV: process.env.NODE_ENV || "development",
 
   // CORS
-  CORS_ORIGINS: process.env.CORS_ORIGINS 
-    ? process.env.CORS_ORIGINS.split(",").map(origin => origin.trim()) 
-    : ["http://localhost:3001"],
+  CORS_ORIGINS: Array.from(new Set([
+    ...(process.env.CORS_ORIGINS
+      ? process.env.CORS_ORIGINS.split(",").map(origin => origin.trim())
+      : ["http://localhost:3000", "http://localhost:3001"]),
+    "https://pustara.vercel.app",
+    "https://pustara-deployfe.vercel.app",  // ✅ Frontend Vercel deployment
+  ])),
     
   // Firebase
   FIREBASE_PROJECT_ID: process.env.FIREBASE_PROJECT_ID,

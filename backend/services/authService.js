@@ -43,9 +43,9 @@ class AuthService {
   }
 
   /**
-   * Get user profile
+   * Get user profile with role
    * @param {string} uid - User ID
-   * @returns {Promise<Object>} - User profile
+   * @returns {Promise<Object>} - User profile with role
    */
   async getUserProfile(uid) {
     const result = await this.provider.getUser(uid);
@@ -58,9 +58,20 @@ class AuthService {
       };
     }
 
+    // Fetch role from database
+    const roleResult = await UserService.getUserRole(uid);
+    const role = roleResult.success ? roleResult.role : 'reader';
+
     return {
       success: true,
-      user: result.data,
+      user: {
+        ...result.data,
+        role,
+      },
+      data: {
+        ...result.data,
+        role,
+      },
       status: 200,
     };
   }
@@ -103,11 +114,9 @@ class AuthService {
       };
     }
 
-    console.log(`[AUTH] Attempting signUp for ${email}`);
     const result = await this.provider.createUser(email, password);
 
     if (!result.success) {
-      console.log(`[AUTH] ❌ createUser failed:`, result.error);
       return {
         success: false,
         error: result.error || "Sign up failed",
@@ -115,7 +124,6 @@ class AuthService {
       };
     }
 
-    console.log(`[AUTH] ✅ Firebase account created for ${email}`);
     // Save user to Azure SQL Database
     const dbResult = await UserService.createUser(result.data.uid, result.data.email);
 
@@ -152,11 +160,9 @@ class AuthService {
       };
     }
 
-    console.log(`[AUTH] Attempting signIn for ${email}`);
     const result = await this.provider.signInWithEmailPassword(email, password);
 
     if (!result.success) {
-      console.log(`[AUTH] ❌ signInWithEmailPassword failed:`, result.error);
       return {
         success: false,
         error: result.error || "Sign in failed",
@@ -164,7 +170,6 @@ class AuthService {
       };
     }
 
-    console.log(`[AUTH] ✅ Firebase auth succeeded for ${email}`);
     // Fetch user data dari Azure SQL Database
     const uid = result.data.uid;
     const dbResult = await UserService.getUserByUid(uid);
@@ -178,6 +183,8 @@ class AuthService {
         // Still return success karena Firebase auth berhasil
       }
     }
+
+    await UserService.recordLoginEvent(uid);
 
     return {
       success: true,

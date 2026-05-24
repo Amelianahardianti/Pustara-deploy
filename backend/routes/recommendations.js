@@ -6,6 +6,10 @@
 const express = require('express');
 const { pushActivity, getUserRecentBooks } = require('../services/redis');
 const UserSurveyService = require('../services/userSurveyService');
+const db = require('../config/database');
+
+const TRENDING_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const TRENDING_RESPONSE_CACHE = new Map();
 
 const getAiUrl = () => process.env.FASTAPI_URL || 'http://localhost:8001';
 
@@ -115,8 +119,10 @@ function normalizeRecommendation(rec = {}) {
 }
 
 function normalizeRecommendationsPayload(result = {}) {
-  const recommendations = Array.isArray(result.recommendations)
-    ? result.recommendations.map(normalizeRecommendation)
+  // Support multiple possible keys from the AI service response
+  const raw = result.recommendations ?? result.items ?? result.results ?? result.data ?? [];
+  const recommendations = Array.isArray(raw)
+    ? raw.map(normalizeRecommendation)
     : [];
 
   return {
@@ -175,59 +181,25 @@ async function proxyToAI(method, path, body = null) {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${process.env.HF_TOKEN}`,
     },
-    timeout: 10000, // 10 second timeout
   };
   if (body) options.body = JSON.stringify(body);
 
-  // 🔍 DEBUG: Log exact URL and timing
-  const startTime = Date.now();
-  console.log(`\n[AI Proxy START] ${method} → ${url}`);
-  console.log(`[AI Proxy] Timeout: 10000ms | FastAPI URL: ${getAiUrl()}`);
-  
-  try {
-    const response = await fetch(url, options);
-    
-    // Check if response is JSON
-    const contentType = response.headers.get('content-type');
-    if (!contentType || !contentType.includes('application/json')) {
-      const text = await response.text();
-      console.error(`[AI Proxy] Non-JSON response (${response.status}):`, text.substring(0, 200));
-      const err = new Error(`AI service returned non-JSON response (status: ${response.status}). Service may be unreachable.`);
-      err.status = response.status;
-      throw err;
-    }
+  console.log(`[AI Proxy] ${method} → ${url}`);
+  const response = await fetch(url, options);
+  const data     = await response.json();
 
-    const data = await response.json();
+  console.log(
+    '[AI Proxy] STATUS:', response.status,
+    '| KEYS:', Object.keys(data),
+    '| recs count:', data?.recommendations?.length ?? data?.items?.length ?? data?.results?.length ?? data?.data?.length ?? 'N/A'
+  );
 
-    if (!response.ok) {
-      const err = new Error(data.detail || `AI service error: ${response.status}`);
-      err.status = response.status;
-      throw err;
-    }
-    
-    return data;
-  } catch (error) {
-    // Handle specific error types
-    if (error instanceof TypeError && error.message.includes('fetch')) {
-      // Network error
-      console.error(`[AI Proxy] Network/Connection Error:`, error.message);
-      throw new Error(`Cannot reach AI service at ${getAiUrl()}. Service may be down.`);
-    }
-    
-    if (error instanceof SyntaxError && error.message.includes('JSON')) {
-      console.error(`[AI Proxy] JSON parse error:`, error.message);
-      throw new Error('AI service response is not valid JSON. Service may be down.');
-    }
-    
-    if (error.name === 'AbortError') {
-      console.error(`[AI Proxy] Request timeout after 10s`);
-      throw new Error('AI service request timed out (10s). Service may be slow or unresponsive.');
-    }
-
-    // Re-throw dengan context
-    console.error(`[AI Proxy] Unhandled error:`, error.message);
-    throw error;
+  if (!response.ok) {
+    const err = new Error(data.detail || `AI service error: ${response.status}`);
+    err.status = response.status;
+    throw err;
   }
+  return data;
 }
 
 /**
@@ -266,12 +238,50 @@ async function getUserSurveyContext(uid) {
 
       genresArray = genresArray.filter((genre) => genre && genre !== '__SKIPPED__');
 
-      return {
+      const surveyResult = {
         user_gender:      result.data.gender || null, // "L", "P", "X"
         user_age:         result.data.age ? String(result.data.age) : null,
         user_age_group:   ageGroup,
         preferred_genres: genresArray.length > 0 ? genresArray : null,
       };
+
+      // Enhance with chat history genres if survey genres are missing
+      if (!surveyResult.preferred_genres || surveyResult.preferred_genres.length === 0) {
+        try {
+          const chatGenres = await db.executeQuery(
+            `SELECT detected_genre FROM chat_analytics
+             WHERE user_id = $1 AND detected_genre IS NOT NULL
+             ORDER BY ts DESC
+             LIMIT 20`,
+            [uid]
+          );
+
+          const rows = Array.isArray(chatGenres) ? chatGenres : 
+                       (chatGenres && Array.isArray(chatGenres.rows)) ? chatGenres.rows :
+                       (chatGenres && Array.isArray(chatGenres.recordset)) ? chatGenres.recordset : [];
+
+          if (rows.length > 0) {
+            const genreCount = {};
+            rows.forEach(({ detected_genre }) => {
+              if (detected_genre) {
+                genreCount[detected_genre] = (genreCount[detected_genre] || 0) + 1;
+              }
+            });
+            const topChatGenres = Object.entries(genreCount)
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 3)
+              .map(([g]) => g);
+
+            if (topChatGenres.length > 0) {
+              surveyResult.preferred_genres = topChatGenres;
+            }
+          }
+        } catch (e) {
+          console.warn('[ChatAnalytics] Failed to fetch user genre history:', e.message);
+        }
+      }
+
+      return surveyResult;
     }
   } catch (e) {
     console.warn('[Survey] Failed to fetch user survey:', e.message);
@@ -436,50 +446,19 @@ function createRecommendationsRoutes(verifyTokenMiddleware, optionalVerifyTokenM
     '/trending',
     optionalVerifyTokenMiddleware,
     asyncHandler(async (req, res) => {
-      const requestId = `[REC-TRENDING-${Date.now()}]`;
-      
-      try {
-        // 🔍 DEBUG: Verify this endpoint is called
-        console.log(`\n╔════════════════════════════════════════════════════════════╗`);
-        console.log(`║ [EXEC] recommendations /trending endpoint CALLED          ║`);
-        console.log(`║ Source: backend/routes/recommendations.js line 432       ║`);
-        console.log(`║ Type: FETCH TO FastAPI (will call proxyToAI)             ║`);
-        console.log(`║ FastAPI URL: ${getAiUrl()}                  ║`);
-        console.log(`╚════════════════════════════════════════════════════════════╝`);
-        console.log(`${requestId} Starting recommendations/trending request`);
-        
-        const { top_n = 10 } = req.query;
-        const uid = req.user?.uid;
-        const surveyCtx = uid ? await getUserSurveyContext(uid) : {};
-
-        const params = new URLSearchParams({ n: top_n, top_n: top_n });
-        
-        if (surveyCtx.user_gender) params.set('gender', surveyCtx.user_gender);
-        if (surveyCtx.user_age_group) params.set('age_group', surveyCtx.user_age_group);
-
-        console.log(`${requestId} Calling proxyToAI...`);
-        const result = await proxyToAI('GET', `/recommendations/trending?${params.toString()}`);
-        console.log(`${requestId} ✅ AI Proxy succeeded`);
-        
-        res.json({ success: true, data: normalizeTrendingPayload(result) });
-      } catch (err) {
-        console.error(`${requestId} ⚠️  AI Proxy failed - returning graceful fallback:`, err.message);
-        
-        // Fallback: return empty recommendations dengan 200 status
-        // Client dapat response yang valid meski AI service down
-        res.status(200).json({
-          success: true, // Success pero empty data
-          data: {
-            trending: [],
-            recommendations: [],
-          },
-          meta: {
-            source: 'fallback',
-            reason: 'AI service temporarily unavailable',
-            timestamp: new Date().toISOString(),
-          },
-        });
+      const { top_n = 10 } = req.query;
+      const cacheKey = `trending:${top_n}`;
+      const cached = TRENDING_RESPONSE_CACHE.get(cacheKey);
+      if (cached && (Date.now() - cached.at) < TRENDING_CACHE_TTL_MS) {
+        res.json({ success: true, data: cached.data });
+        return;
       }
+
+      const params = new URLSearchParams({ n: top_n, top_n: top_n });
+      const result = await proxyToAI('GET', `/recommendations/trending?${params}`);
+      const data = normalizeTrendingPayload(result);
+      TRENDING_RESPONSE_CACHE.set(cacheKey, { at: Date.now(), data });
+      res.json({ success: true, data });
     })
   );
 
@@ -493,6 +472,37 @@ function createRecommendationsRoutes(verifyTokenMiddleware, optionalVerifyTokenM
       } catch (err) {
         res.status(503).json({ success: false, ai_service: 'down', error: err.message });
       }
+    })
+  );
+
+  // GET /recommendations/search?q=buku+sedih&n=10
+  router.get(
+    '/search',
+    optionalVerifyTokenMiddleware,
+    asyncHandler(async (req, res) => {
+      const { q, n = 10, language } = req.query;
+      if (!q?.trim()) return res.status(400).json({ success: false, error: 'q is required' });
+
+      const uid = req.user?.uid;
+      const params = new URLSearchParams({ q, n });
+      if (language) params.set('language', language);
+      if (uid) params.set('user_id', uid);
+
+      const result = await proxyToAI('GET', `/search/semantic?${params}`);
+      res.json({ success: true, data: result });
+    })
+  );
+
+  // GET /recommendations/similar-users?user_id=...&n=8
+  router.get(
+    '/similar-users',
+    verifyTokenMiddleware,
+    asyncHandler(async (req, res) => {
+      const { n = 8 } = req.query;
+      const uid = req.user.uid;
+      const params = new URLSearchParams({ user_id: uid, n });
+      const result = await proxyToAI('GET', `/recommendations/similar-users?${params}`);
+      res.json({ success: true, data: normalizeRecommendationsPayload(result) });
     })
   );
 

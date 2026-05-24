@@ -90,3 +90,5 @@ Thumbs.db
 
 # dataconnect generated files
 .dataconnect
+.vercel
+.env*.local
