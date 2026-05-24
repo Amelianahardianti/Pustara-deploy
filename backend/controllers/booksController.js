@@ -6,6 +6,58 @@ const db = require('../config/database');
 const storage = require('../providers/localStorageProvider');
 const { v4: uuidv4 } = require('uuid');
 
+const SUPABASE_PROJECT_URL = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_BUCKET = 'pustara-storage';
+
+function getBackendBaseUrl(req) {
+  const forwardedProto = Array.isArray(req.headers['x-forwarded-proto'])
+    ? req.headers['x-forwarded-proto'][0]
+    : req.headers['x-forwarded-proto'];
+  const forwardedHost = Array.isArray(req.headers['x-forwarded-host'])
+    ? req.headers['x-forwarded-host'][0]
+    : req.headers['x-forwarded-host'];
+
+  const protocol = String(forwardedProto || req.protocol || 'http').split(',')[0].trim() || 'http';
+  const host = String(forwardedHost || req.get('host') || '').split(',')[0].trim();
+
+  if (!host) {
+    return `http://localhost:${process.env.PORT || 3000}`;
+  }
+
+  return `${protocol}://${host}`;
+}
+
+function getBookFileEndpoint(req, bookId) {
+  return `${getBackendBaseUrl(req)}/books/${bookId}/file`;
+}
+
+function getSupabasePublicUrl(fileUrl) {
+  if (!fileUrl) return null;
+
+  if (/^https?:\/\//i.test(fileUrl)) {
+    if (fileUrl.includes('/storage/v1/object/public/')) {
+      return fileUrl;
+    }
+    return null;
+  }
+
+  if (!SUPABASE_PROJECT_URL) {
+    return null;
+  }
+
+  const normalizedPath = String(fileUrl)
+    .replace(/^\/+/, '')
+    .replace(/^storage\/v1\/object\/public\//, '');
+
+  if (!normalizedPath) return null;
+
+  if (normalizedPath.startsWith(`${SUPABASE_BUCKET}/`)) {
+    return `${SUPABASE_PROJECT_URL}/storage/v1/object/public/${normalizedPath}`;
+  }
+
+  return `${SUPABASE_PROJECT_URL}/storage/v1/object/public/${SUPABASE_BUCKET}/${normalizedPath}`;
+}
+
 /**
  * Generate placeholder cover image (base64 SVG)
  * Works offline, no external dependencies
@@ -88,7 +140,7 @@ exports.getBooks = async (req, res) => {
           ? `https://covers.openlibrary.org/b/isbn/${book.isbn.replace(/[-\s]/g, '')}-M.jpg`
           : getPlaceholderCover(book.title),
       file_url: book.file_url && book.id
-        ? `http://localhost:3000/books/${book.id}/file`
+        ? getBookFileEndpoint(req, book.id)
         : null
     }));
 
@@ -146,7 +198,7 @@ exports.searchBooks = async (req, res) => {
       year: book.year,
       pages: book.pages,
       description: book.description,
-      file_url: book.file_url ? `http://localhost:3000/books/${book.id}/file` : null
+      file_url: book.file_url ? getBookFileEndpoint(req, book.id) : null
     }));
 
     res.json({
@@ -185,7 +237,10 @@ exports.getBookDetail = async (req, res) => {
 
     res.json({
       success: true,
-      data: book
+      data: {
+        ...book,
+        file_url: book.file_url ? getBookFileEndpoint(req, book.id) : null,
+      }
     });
   } catch (error) {
     console.error('Error fetching book detail:', error.message);
@@ -265,6 +320,11 @@ exports.downloadBookFile = async (req, res) => {
 
     if (!book.file_url) {
       return res.status(404).json({ success: false, message: 'Book file not available' });
+    }
+
+    const supabasePublicUrl = getSupabasePublicUrl(book.file_url);
+    if (supabasePublicUrl) {
+      return res.redirect(302, supabasePublicUrl);
     }
 
     // If user authenticated, log reading session (fire and forget)
@@ -541,7 +601,7 @@ exports.getTrendingBooks = async (req, res) => {
           : getPlaceholderCover(book.title),
       avg_rating: parseFloat(book.avg_rating) || 0,
       rating_count: parseInt(book.rating_count) || 0,
-      file_url: book.file_url,
+      file_url: book.file_url ? getBookFileEndpoint(req, book.id) : null,
       trending_score: parseInt(book.trending_score) || 0
     }));
 
