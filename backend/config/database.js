@@ -257,7 +257,7 @@ async function executeQuery(query, params = []) {
   if (isNeon) {
     if (!pgPool) throw new Error('Neon DB not initialized. Call initializeDatabase() first');
     const result = await pgPool.query(query, params);
-    return result.rows;
+    return { rows: result.rows };
   }
 
   // Azure SQL logic
