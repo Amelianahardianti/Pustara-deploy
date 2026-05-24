@@ -5,6 +5,7 @@ const { Redis } = require('@upstash/redis');
 const { executeQuery, isNeon } = require('../config/database');   
 const { insertNotification, getAllNotifiableUsers } = require('../services/notificationService');
 const { sendEmail } = require('../services/emailService');
+const { expireStaleQueueReservations } = require('../controllers/shelfController');
 
 const FASTAPI_URL = process.env.FASTAPI_URL;
 const HF_TOKEN    = process.env.HF_TOKEN;
@@ -766,5 +767,15 @@ cron.schedule('0 * * * *', async () => {
 */
 
 log('INIT', '🚀 All Pustara Cron Job systems are active!');
+
+cron.schedule('*/30 * * * *', async () => {
+  log('QUEUE', 'Reconciling queue reservations...');
+  try {
+    const result = await expireStaleQueueReservations();
+    log('QUEUE', `Queue reservation reconciliation processed ${result.processed || 0} books.`);
+  } catch (err) {
+    log('QUEUE', `Queue reservation reconciliation failed: ${err.message}`);
+  }
+}, { timezone: 'Asia/Jakarta' });
 
 module.exports = {};
