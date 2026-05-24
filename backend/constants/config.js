@@ -13,6 +13,7 @@ const CONFIG = {
       ? process.env.CORS_ORIGINS.split(",").map(origin => origin.trim())
       : ["http://localhost:3000", "http://localhost:3001"]),
     "https://pustara.vercel.app",
+    "https://pustara-deployfe.vercel.app",  // ✅ Frontend Vercel deployment
   ])),
     
   // Firebase
