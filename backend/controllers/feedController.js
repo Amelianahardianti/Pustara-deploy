@@ -80,9 +80,24 @@ async function resolveActorUserId(req) {
   if (!req.user?.uid) return null;
 
   const actor = await UserService.getUserByUid(req.user.uid);
-  if (!actor.success || !actor.data?.id) return null;
+  if (actor.success && actor.data?.id) {
+    return String(actor.data.id);
+  }
 
-  return String(actor.data.id);
+  const email = req.user.email || null;
+  if (email) {
+    const created = await UserService.createUser(
+      req.user.uid,
+      email,
+      req.user.name || req.user.displayName || null
+    );
+
+    if (created.success && created.data?.id) {
+      return String(created.data.id);
+    }
+  }
+
+  return null;
 }
 
 async function fetchActivityRows(actorUserId, limit, includeNetwork = false) {
