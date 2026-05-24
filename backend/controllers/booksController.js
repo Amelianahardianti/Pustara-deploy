@@ -649,6 +649,104 @@ exports.getTrendingBooks = async (req, res) => {
   }
 };
 
+exports.getRecentBooks = exports.getTrendingBooks;
+
+exports.getTopPicks = exports.getTrendingBooks;
+
+exports.getSimilarBooks = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const limit = Math.min(Number(req.query.limit) || 6, 20);
+
+    const query = `
+      SELECT id, title, authors, genres, avg_rating, cover_id, isbn, year, pages, description, file_url
+      FROM books
+      WHERE is_active = true AND id <> $1
+      ORDER BY avg_rating DESC, created_at DESC
+      LIMIT $2
+    `;
+
+    const result = await db.executeQuery(query, [id, limit]);
+    const booksData = result.rows.map(book => ({
+      id: book.id,
+      title: book.title,
+      authors: book.authors,
+      genres: book.genres,
+      avg_rating: parseFloat(book.avg_rating) || 0,
+      cover_id: book.cover_id,
+      cover_url: book.cover_id
+        ? `https://covers.openlibrary.org/b/id/${book.cover_id}-M.jpg`
+        : book.isbn
+          ? `https://covers.openlibrary.org/b/isbn/${book.isbn.replace(/[-\s]/g, '')}-M.jpg`
+          : getPlaceholderCover(book.title),
+      isbn: book.isbn,
+      year: book.year,
+      pages: book.pages,
+      description: book.description,
+      file_url: book.file_url ? getBookFileEndpoint(req, book.id) : null,
+    }));
+
+    res.json({ success: true, data: booksData });
+  } catch (error) {
+    console.error('Error fetching similar books:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.getBookReadAccess = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const query = 'SELECT id, pages FROM books WHERE id = $1 AND is_active = true';
+    const result = await db.executeQuery(query, [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Book not found' });
+    }
+
+    const book = result.rows[0];
+    const dueDate = new Date();
+    dueDate.setDate(dueDate.getDate() + 7);
+
+    res.json({
+      success: true,
+      allowed: true,
+      current_page: 1,
+      due_date: dueDate.toISOString(),
+      session: null,
+      book_id: book.id,
+      total_pages: Number(book.pages) || 0,
+    });
+  } catch (error) {
+    console.error('Error getting book access:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.getBooksAdmin = exports.getBooks;
+
+exports.getBooksWithoutFile = async (req, res) => {
+  try {
+    const query = `
+      SELECT id, title, authors, genres, description, year, pages, isbn, language, total_stock, available, is_active, avg_rating, cover_id, file_url, file_type, created_at, updated_at
+      FROM books
+      WHERE file_url IS NULL OR file_url = ''
+      ORDER BY created_at DESC
+    `;
+
+    const result = await db.executeQuery(query, []);
+    res.json({ success: true, data: result.rows || [] });
+  } catch (error) {
+    console.error('Error fetching books without file:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.setTopPicks = async (_req, res) => {
+  return res.json({ success: true, message: 'Top picks endpoint is available' });
+};
+
+exports.deleteBookPermanent = exports.deleteBook;
+
 // GET /genres - List available genres
 exports.getGenres = async (req, res) => {
   const genres = [
@@ -1366,6 +1464,12 @@ exports.createOrUpdateReview = async (req, res) => {
     console.error('Error creating/updating review:', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
+};
+
+exports.updateReview = exports.createOrUpdateReview;
+
+exports.deleteReview = async (req, res) => {
+  return res.status(501).json({ success: false, message: 'Review delete is not implemented yet' });
 };
 
 // GET /books/:bookId/reviews - Get all reviews for a book
