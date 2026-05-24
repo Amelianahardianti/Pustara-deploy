@@ -1,179 +1,785 @@
-// Books Controller dengan file handling
+// Books Controller dengan Azure Blob file handling
 const db = require('../config/database');
-// PRODUCTION: Uncomment Azure Blob
-// const azureBlob = require('../providers/azureBlobProvider');
-// DEVELOPMENT: Using local filesystem storage
-const storage = require('../providers/localStorageProvider');
+const azureBlob = require('../providers/azureBlobProvider');
 const { v4: uuidv4 } = require('uuid');
+const { sendOpsAlert } = require('../services/opsAlertService');
+const { insertNotification, getAllNotifiableUsers } = require('../services/notificationService');
+const { sendEmail } = require('../services/emailService');
+const { Readable } = require('stream');
 
-const SUPABASE_PROJECT_URL = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '').replace(/\/+$/, '');
-const SUPABASE_BUCKET = 'pustara-storage';
-
-async function pipeRemotePdf(response, res) {
-  const { Readable } = require('stream');
-
-  if (!response.body) {
-    const buffer = Buffer.from(await response.arrayBuffer());
-    res.end(buffer);
-    return;
-  }
-
-  if (typeof Readable.fromWeb === 'function') {
-    Readable.fromWeb(response.body).pipe(res);
-    return;
-  }
-
-  const buffer = Buffer.from(await response.arrayBuffer());
-  res.end(buffer);
+function toRows(result) {
+  if (Array.isArray(result)) return result;
+  if (result && Array.isArray(result.rows)) return result.rows;
+  if (result && Array.isArray(result.recordset)) return result.recordset;
+  return [];
 }
 
-function getBackendBaseUrl(req) {
-  const forwardedProto = Array.isArray(req.headers['x-forwarded-proto'])
-    ? req.headers['x-forwarded-proto'][0]
-    : req.headers['x-forwarded-proto'];
-  const forwardedHost = Array.isArray(req.headers['x-forwarded-host'])
-    ? req.headers['x-forwarded-host'][0]
-    : req.headers['x-forwarded-host'];
-
-  const protocol = String(forwardedProto || req.protocol || 'http').split(',')[0].trim() || 'http';
-  const host = String(forwardedHost || req.get('host') || '').split(',')[0].trim();
-
-  if (!host) {
-    return `http://localhost:${process.env.PORT || 3000}`;
+function parseGenresCell(value) {
+  if (Array.isArray(value)) {
+    return value.map((v) => String(v).trim()).filter(Boolean);
   }
 
-  return `${protocol}://${host}`;
-}
+  if (typeof value === 'string') {
+    const raw = value.trim();
+    if (!raw) return [];
 
-function getBookFileEndpoint(req, bookId) {
-  return `${getBackendBaseUrl(req)}/books/${bookId}/file`;
-}
-
-function getSupabasePublicUrl(fileUrl) {
-  if (!fileUrl) return null;
-
-  if (/^https?:\/\//i.test(fileUrl)) {
-    if (fileUrl.includes('/storage/v1/object/public/')) {
-      return fileUrl;
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.map((v) => String(v).trim()).filter(Boolean);
+      }
+    } catch (_) {
+      // ignore JSON parsing errors and continue with delimiter parsing
     }
-    return null;
+
+    if (raw.startsWith('{') && raw.endsWith('}')) {
+      return raw
+        .slice(1, -1)
+        .split(',')
+        .map((v) => v.replace(/^"|"$/g, '').trim())
+        .filter(Boolean);
+    }
+
+    return raw
+      .split(',')
+      .map((v) => v.trim())
+      .filter(Boolean);
   }
 
-  if (!SUPABASE_PROJECT_URL) {
-    return null;
-  }
+  return [];
+}
 
-  const normalizedPath = String(fileUrl)
-    .replace(/^\/+/, '')
-    .replace(/^storage\/v1\/object\/public\//, '');
+function parseArrayCell(value) {
+  return parseGenresCell(value);
+}
 
-  if (!normalizedPath) return null;
+function parseOptionalNumberCell(value) {
+  if (value == null || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 
-  if (normalizedPath.startsWith(`${SUPABASE_BUCKET}/`)) {
-    return `${SUPABASE_PROJECT_URL}/storage/v1/object/public/${normalizedPath}`;
-  }
+function normalizeBookRow(book) {
+  if (!book) return book;
 
-  return `${SUPABASE_PROJECT_URL}/storage/v1/object/public/${SUPABASE_BUCKET}/${normalizedPath}`;
+  return {
+    ...book,
+    authors: parseArrayCell(book.authors),
+    genres: parseArrayCell(book.genres),
+  };
+}
+
+function sanitizePagination(value, fallback, min, max) {
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(Math.max(parsed, min), max);
 }
 
 /**
- * Generate placeholder cover image (base64 SVG)
- * Works offline, no external dependencies
+ * Parse query boolean values used by list filters.
  */
-function getPlaceholderCover(title) {
-  if (!title) title = 'Book';
-  
-  // Truncate title for display
-  const displayTitle = title.substring(0, 20);
-  
-  // Generate color based on title hash
-  const colors = ['#667eea', '#764ba2', '#f093fb', '#4facfe', '#43e97b', '#fa709a', '#fee140', '#30cfd0'];
-  let hash = 0;
-  for (let i = 0; i < title.length; i++) {
-    hash = ((hash << 5) - hash) + title.charCodeAt(i);
-    hash = hash & hash;
-  }
-  const color = colors[Math.abs(hash) % colors.length];
-  
-  // Create SVG placeholder
-  const svg = `
-    <svg width="200" height="300" xmlns="http://www.w3.org/2000/svg">
-      <rect width="200" height="300" fill="${color}"/>
-      <text x="100" y="150" font-size="18" fill="white" text-anchor="middle" font-weight="bold" font-family="Arial">
-        <tspan x="100" dy="0">${displayTitle}</tspan>
-      </text>
-      <text x="100" y="260" font-size="12" fill="rgba(255,255,255,0.7)" text-anchor="middle" font-family="Arial">
-        Pustara
-      </text>
-    </svg>
-  `;
-  
-  // Convert to base64
-  const base64 = Buffer.from(svg).toString('base64');
-  return `data:image/svg+xml;base64,${base64}`;
+function parseBooleanQuery(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'true' || normalized === '1') return true;
+  if (normalized === 'false' || normalized === '0') return false;
+  return null;
 }
 
-// GET /books - List all books dengan pagination & filters
-exports.getBooks = async (req, res) => {
+function withDownloadUrl(book, req) {
+  if (!book || !book.id) return book;
+
+  // Only provide proxy download URL if the book actually has a file in the database
+  // This preserves null/undefined file_url so the frontend can show upload buttons
+  if (!book.file_url) return book;
+
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  return {
+    ...book,
+    file_url: `${baseUrl}/books/${book.id}/file`,
+  };
+}
+
+function isUuidLike(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || ''));
+}
+
+async function getQueueCountByBookId(bookId) {
   try {
-    const { page = 1, limit = 10, genre, sort = 'created_at', order = 'DESC' } = req.query;
-    const offset = (page - 1) * limit;
-    
-    let query = 'SELECT * FROM books WHERE is_active = true';
+    const rows = toRows(
+      await db.executeQuery('SELECT COUNT(*) AS total FROM queue WHERE book_id = $1', [bookId])
+    );
+    return Number.parseInt(String(rows[0]?.total || 0), 10) || 0;
+  } catch {
+    // Queue table may be unavailable in some environments. Keep API stable with zero.
+    return 0;
+  }
+}
+
+async function withQueueCounts(books) {
+  const list = Array.isArray(books) ? books : [];
+  const counted = await Promise.all(
+    list.map(async (book) => {
+      const queue = await getQueueCountByBookId(book.id);
+      return {
+        ...book,
+        queue,
+      };
+    })
+  );
+  return counted;
+}
+
+async function listBooks(req, res, { includeInactive = false, defaultSort = 'created_at', defaultOrder = 'DESC' } = {}) {
+  try {
+    const {
+      page = 1,
+      limit = 10,
+      genre,
+      search,
+      available,
+      language,
+      sort = defaultSort,
+      order = defaultOrder,
+    } = req.query;
+    const pageNum = sanitizePagination(page, 1, 1, 100000);
+    const limitNum = sanitizePagination(limit, 10, 1, 100);
+    const offset = (pageNum - 1) * limitNum;
+
+    const baseWhere = includeInactive ? 'WHERE 1=1' : 'WHERE is_active = true';
+    let query = `SELECT * FROM books ${baseWhere}`;
     const params = [];
 
-    // Filter by genre jika ada
+    if (search && String(search).trim()) {
+      const term = `%${String(search).trim()}%`;
+      query += ` AND (title ILIKE $${params.length + 1} OR authors::text ILIKE $${params.length + 1})`;
+      params.push(term);
+    }
+
     if (genre) {
       query += ` AND $${params.length + 1} = ANY(genres)`;
       params.push(genre);
     }
 
-    // Sort
+    const availableFilter = parseBooleanQuery(available);
+    if (availableFilter === true) {
+      query += ' AND COALESCE(available, 0) > 0';
+    } else if (availableFilter === false) {
+      query += ' AND COALESCE(available, 0) <= 0';
+    }
+
+    if (language && String(language).trim()) {
+      query += ` AND language = $${params.length + 1}`;
+      params.push(String(language).trim());
+    }
+
     const validSort = ['created_at', 'avg_rating', 'title', 'year'];
     const validOrder = ['ASC', 'DESC'];
     const sortBy = validSort.includes(sort) ? sort : 'created_at';
     const orderBy = validOrder.includes(order.toUpperCase()) ? order.toUpperCase() : 'DESC';
-    
+
     query += ` ORDER BY ${sortBy} ${orderBy}`;
     query += ` LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
-    params.push(limit, offset);
+    params.push(limitNum, offset);
 
     const result = await db.executeQuery(query, params);
-    
-    // Get total count
-    let countQuery = 'SELECT COUNT(*) as total FROM books WHERE is_active = true';
+    const rows = toRows(result);
+
+    let countQuery = `SELECT COUNT(*) as total FROM books ${baseWhere}`;
     const countParams = [];
+
+    if (search && String(search).trim()) {
+      const term = `%${String(search).trim()}%`;
+      countQuery += ` AND (title ILIKE $${countParams.length + 1} OR authors::text ILIKE $${countParams.length + 1})`;
+      countParams.push(term);
+    }
+
     if (genre) {
-      countQuery += ` AND $1 = ANY(genres)`;
+      countQuery += ` AND $${countParams.length + 1} = ANY(genres)`;
       countParams.push(genre);
     }
+
+    if (availableFilter === true) {
+      countQuery += ' AND COALESCE(available, 0) > 0';
+    } else if (availableFilter === false) {
+      countQuery += ' AND COALESCE(available, 0) <= 0';
+    }
+
+    if (language && String(language).trim()) {
+      countQuery += ` AND language = $${countParams.length + 1}`;
+      countParams.push(String(language).trim());
+    }
+
     const countResult = await db.executeQuery(countQuery, countParams);
+    const countRows = toRows(countResult);
 
-    // Transform file_url to use backend endpoint instead of direct blob URL
-    const booksData = result.rows.map(book => ({
-      ...book,
-      cover_url: book.cover_id 
-        ? `https://covers.openlibrary.org/b/id/${book.cover_id}-M.jpg`
-        : book.isbn
-          ? `https://covers.openlibrary.org/b/isbn/${book.isbn.replace(/[-\s]/g, '')}-M.jpg`
-          : getPlaceholderCover(book.title),
-      file_url: book.file_url && book.id
-        ? getBookFileEndpoint(req, book.id)
-        : null
-    }));
+    const totalItems = Number.parseInt(String(countRows[0]?.total || 0), 10) || 0;
+    const totalPages = Math.max(1, Math.ceil(totalItems / limitNum));
+    const booksDataWithUrl = rows.map((book) => normalizeBookRow(withDownloadUrl(book, req)));
+    const booksData = await withQueueCounts(booksDataWithUrl);
 
-    res.json({
+    return res.json({
       success: true,
       data: booksData,
       pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total: parseInt(countResult.rows[0].total),
-        pages: Math.ceil(parseInt(countResult.rows[0].total) / limit)
-      }
+        page: pageNum,
+        limit: limitNum,
+        total: totalItems,
+        pages: totalPages,
+        total_items: totalItems,
+        total_pages: totalPages,
+      },
     });
   } catch (error) {
     console.error('Error fetching books:', error.message);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+}
+
+// GET /books/recent - Recently added books for homepage and catalog sections
+exports.getRecentBooks = async (req, res) => {
+  return listBooks(req, res, {
+    includeInactive: false,
+    defaultSort: 'created_at',
+    defaultOrder: 'DESC',
+  });
+};
+
+/**
+ * Validate that the authenticated user has an active, unreturned, non-expired loan.
+ */
+async function resolveActiveLoanAccess(firebaseUid, bookId) {
+  if (!firebaseUid) {
+    return { allowed: false, statusCode: 401, message: 'Authentication required' };
+  }
+
+  const userRows = toRows(
+    await db.executeQuery('SELECT id FROM users WHERE firebase_uid = $1 LIMIT 1', [firebaseUid])
+  );
+  const userId = userRows[0]?.id;
+
+  if (!userId) {
+    return { allowed: false, statusCode: 404, message: 'User not found in Pustara database' };
+  }
+
+  const loanRows = toRows(
+    await db.executeQuery(
+      `SELECT id, COALESCE(due_date, due_at) AS due_date
+      FROM loans
+      WHERE user_id = $1
+        AND book_id = $2
+        AND returned_at IS NULL
+        AND COALESCE(due_date, due_at) > NOW()
+      LIMIT 1`,
+      [userId, bookId]
+    )
+  );
+
+  if (loanRows.length === 0) {
+    return {
+      allowed: false,
+      statusCode: 403,
+      message: 'No active loan found for this book or loan already expired',
+      userId,
+    };
+  }
+
+  return {
+    allowed: true,
+    userId ,
+    dueDate: loanRows[0].due_date,
+  };
+}
+
+// // GET /books/:id/reviews - Get book reviews
+exports.getBookReviews = async (req, res) => {
+  let phase = 'init';
+  try {
+    phase = 'parse_request';
+    const { id } = req.params;
+    const { limit = 100, offset = 0 } = req.query;
+    
+    // FIX 1: Inline sanitizePagination biar ga "not defined"
+    const limitParsed = parseInt(limit, 10);
+    const limitNum = !isNaN(limitParsed) ? Math.min(Math.max(limitParsed, 1), 500) : 100;
+    
+    const offsetParsed = parseInt(offset, 10);
+    const offsetNum = !isNaN(offsetParsed) ? Math.max(offsetParsed, 0) : 0;
+
+    console.log('[BookReviews] Request received:', { id, limitQuery: limit, offsetQuery: offset, limitNum, offsetNum });
+
+    // FIX 2: Inline UUID validation biar ga "isUuidLike is not defined"
+    const cleanId = String(id || '').trim();
+    const isValidUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(cleanId);
+    
+    if (!isValidUuid) {
+      console.log('[BookReviews] INVALID UUID:', cleanId);
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid book id format',
+        error: { code: 'INVALID_BOOK_ID', id: cleanId },
+      });
+    }
+
+    // Verify book exists (FIX: Pakai CAST AS TEXT biar 100% jalan)
+    phase = 'book_check';
+    const bookCheck = await db.executeQuery(
+      'SELECT id FROM books WHERE CAST(id AS TEXT) = CAST($1 AS TEXT) AND is_active = true',
+      [cleanId]
+    );
+
+    const bookRows = toRows(bookCheck);
+
+    if (bookRows.length === 0) {
+      console.log('[BookReviews] BOOK NOT FOUND:', cleanId);
+      return res.status(404).json({
+        success: false,
+        message: 'Book not found',
+        error: { code: 'BOOK_NOT_FOUND', id: cleanId },
+      });
+    }
+    console.log('[BookReviews] Book found:', cleanId);
+
+    // Get authenticated user's ID
+    // FIX 3: Jangan passing `null` murni karena bikin driver DB meledak waktu nge-parse $4. Pakai dummy UUID.
+    let viewingUserId = '00000000-0000-0000-0000-000000000000';
+    if (req.user?.uid) {
+      try {
+        phase = 'viewer_lookup';
+        const userRows = toRows(
+          await db.executeQuery(
+            'SELECT id FROM users WHERE firebase_uid = $1 LIMIT 1',
+            [req.user.uid]
+          )
+        );
+        if (userRows[0]?.id) viewingUserId = userRows[0].id;
+      } catch (_) {
+        // If lookup fails, just continue
+      }
+    }
+
+    // Fetch reviews with user info
+    // FIX 4: Ganti syntax ::int dan $4 IS NULL yang rawan crash
+    const query = `
+      SELECT
+        r.id,
+        r.user_id,
+        r.book_id,
+        r.rating,
+        r.review_text as text,
+        r.review_text as body,
+        r.review_text as review_text,
+        r.created_at as time,
+        u.username as username,
+        COALESCE(u.display_name, u.username) as name,
+        u.avatar_url,
+        COALESCE(u.display_name, u.username, 'U') as avatar,
+        (SELECT CAST(COUNT(*) AS INT) FROM review_likes rl2 WHERE CAST(rl2.review_id AS TEXT) = CAST(r.id AS TEXT)) as likes,
+        u.firebase_uid as firebase_uid,
+        (CAST(r.user_id AS TEXT) = CAST($4 AS TEXT)) as is_owner,
+        CASE
+          WHEN CAST($4 AS TEXT) = '00000000-0000-0000-0000-000000000000' THEN FALSE
+          ELSE EXISTS (
+            SELECT 1
+            FROM review_likes rl
+            WHERE CAST(rl.review_id AS TEXT) = CAST(r.id AS TEXT)
+              AND CAST(rl.user_id AS TEXT) = CAST($4 AS TEXT)
+          )
+        END as liked
+      FROM reviews r
+      LEFT JOIN users u ON CAST(r.user_id AS TEXT) = CAST(u.id AS TEXT)
+      WHERE CAST(r.book_id AS TEXT) = CAST($1 AS TEXT)
+        AND (
+          COALESCE(u.public_reviews, true) = true
+          OR CAST(r.user_id AS TEXT) = CAST($4 AS TEXT)
+        )
+      ORDER BY r.created_at DESC
+      LIMIT $2 OFFSET $3
+    `;
+
+    console.log('[BookReviews] Query:', { bookId: cleanId, limit: limitNum, offset: offsetNum, viewingUserId });
+    phase = 'reviews_list_query';
+    const result = await db.executeQuery(query, [cleanId, limitNum, offsetNum, viewingUserId]);
+    const reviews = toRows(result);
+    
+    console.log('[BookReviews] Fetched reviews:', reviews.length, 'for book', cleanId);
+    if (reviews.length > 0) {
+      console.log('[BookReviews] First review sample:', { id: reviews[0]?.id, rating: reviews[0]?.rating, textLen: String(reviews[0]?.text || '').length });
+    } else {
+      console.log('[BookReviews] NO REVIEWS FOUND for book:', cleanId);
+    }
+
+    // Get total count
+    phase = 'reviews_count_query';
+    const countResult = await db.executeQuery(
+      `SELECT CAST(COUNT(*) AS INT) as total FROM reviews r
+       LEFT JOIN users u ON CAST(r.user_id AS TEXT) = CAST(u.id AS TEXT)
+       WHERE CAST(r.book_id AS TEXT) = CAST($1 AS TEXT)
+         AND (COALESCE(u.public_reviews, true) = true OR CAST(r.user_id AS TEXT) = CAST($2 AS TEXT))`,
+      [cleanId, viewingUserId]
+    );
+
+    const countRows = toRows(countResult);
+    const totalReviews = Number.parseInt(String(countRows[0]?.total || 0), 10) || 0;
+
+    const responsePayload = {
+      success: true,
+      data: reviews,
+      pagination: {
+        limit: limitNum,
+        offset: offsetNum,
+        total: totalReviews,
+      },
+    };
+
+    console.log('[BookReviews] SENDING RESPONSE:', {
+      success: true,
+      dataCount: reviews.length,
+      dataIsArray: Array.isArray(reviews),
+      total: totalReviews
+    });
+
+    res.json(responsePayload);
+  } catch (error) {
+    console.error('[BookReviews] EXCEPTION ERROR:', { phase, message: error.message, stack: error.stack });
+
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      error: {
+        code: 'BOOK_REVIEWS_QUERY_FAILED',
+        phase,
+      },
+    });
+  }
+};
+
+// POST /reviews - Create or update a review
+exports.createOrUpdateReview = async (req, res) => {
+  try {
+    const { book_id, rating, body } = req.body;
+    const firebase_uid = req.user?.uid;
+    const { isNeon } = require('../config/database');
+
+    if (!firebase_uid) {
+    return res.status(401).json({
+      success: false,
+      message: 'User not authenticated',
+      });
+    }
+
+    const userResult = await db.executeQuery(
+      'SELECT id FROM users WHERE firebase_uid = $1',
+      [firebase_uid]
+    );
+
+    const userRows = toRows(userResult);
+
+    if (userRows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found',
+      });
+    }
+
+    const user_id = userRows[0].id;
+
+    // Validation
+    if (!book_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'book_id is required',
+      });
+    }
+
+    if (!rating || rating < 1 || rating > 5) {
+      return res.status(400).json({
+        success: false,
+        message: 'rating must be 1-5',
+      });
+    }
+
+    if (!body || typeof body !== 'string' || body.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'body is required',
+      });
+    }
+
+    if (!user_id) {
+      return res.status(401).json({
+        success: false,
+        message: 'User not authenticated',
+      });
+    }
+
+    // Check if review exists
+    const checkQuery =
+      'SELECT id FROM reviews WHERE book_id::text = $1::text AND user_id = $2';
+
+    const checkResult = await db.executeQuery(checkQuery, [
+      book_id,
+      user_id,
+    ]);
+
+    const existingRows = toRows(checkResult);
+
+    let query;
+    let values;
+    let reviewId;
+
+    // Use appropriate column name based on database type
+    const reviewColumn = isNeon ? 'review_text' : 'body';
+    const returnColumns = isNeon
+      ? 'id, rating, review_text as body, created_at, updated_at'
+      : 'id, rating, body, created_at, updated_at';
+
+    if (existingRows.length > 0) {
+      // UPDATE existing review
+      reviewId = existingRows[0].id;
+
+      query = `
+        UPDATE reviews
+        SET rating = $1, ${reviewColumn} = $2, updated_at = NOW()
+        WHERE id = $3 AND user_id = $4
+        RETURNING ${returnColumns}
+      `;
+
+      values = [rating, body, reviewId, user_id];
+    } else {
+      // INSERT new review
+      query = `
+        INSERT INTO reviews (user_id, book_id, rating, ${reviewColumn})
+        VALUES ($1, $2, $3, $4)
+        RETURNING ${returnColumns}
+      `;
+
+      values = [user_id, book_id, rating, body];
+    }
+
+    const result = await db.executeQuery(query, values);
+    const rows = toRows(result);
+
+    if (rows.length === 0) {
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to save review',
+      });
+    }
+
+    const review = rows[0];
+
+    res.json({
+      success: true,
+      data: {
+        id: review.id,
+        book_id,
+        user_id,
+        rating: review.rating,
+        body: review.body,
+        created_at: review.created_at,
+        updated_at: review.updated_at,
+      },
+    });
+  } catch (error) {
+    console.error('Error creating/updating review:', error.message);
+
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+// PUT /reviews/:id - Update a review (only owner)
+exports.updateReview = async (req, res) => {
+  try {
+    const reviewId = req.params.reviewId;
+    const { rating, body } = req.body;
+    const firebase_uid = req.user?.uid;
+    const { isNeon } = require('../config/database');
+
+    if (!firebase_uid) return res.status(401).json({ success: false, message: 'User not authenticated' });
+    if (!isUuidLike(reviewId)) return res.status(400).json({ success: false, message: 'Invalid review id' });
+
+    const userResult = await db.executeQuery('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
+    const userRows = toRows(userResult);
+    if (!userRows.length) return res.status(404).json({ success: false, message: 'User not found' });
+    const user_id = userRows[0].id;
+
+    const reviewRows = toRows(await db.executeQuery('SELECT id, user_id, book_id FROM reviews WHERE id = $1', [reviewId]));
+    if (!reviewRows.length) return res.status(404).json({ success: false, message: 'Review not found' });
+    if (String(reviewRows[0].user_id) !== String(user_id)) return res.status(403).json({ success: false, message: 'Forbidden' });
+
+    const sets = [];
+    const values = [];
+    let idx = 1;
+    if (typeof rating !== 'undefined' && rating !== null) {
+      sets.push(`rating = $${idx++}`);
+      values.push(rating);
+    }
+    if (typeof body !== 'undefined' && body !== null) {
+      const reviewColumn = isNeon ? 'review_text' : 'body';
+      sets.push(`${reviewColumn} = $${idx++}`);
+      values.push(body);
+    }
+
+    if (sets.length === 0) return res.status(400).json({ success: false, message: 'Nothing to update' });
+
+    // always update updated_at
+    sets.push('updated_at = NOW()');
+
+    values.push(reviewId);
+    values.push(user_id);
+
+    const query = `UPDATE reviews SET ${sets.join(', ')} WHERE id = $${values.length - 1} AND user_id = $${values.length} RETURNING id, rating, ${isNeon ? 'review_text as body' : 'body'}, created_at, updated_at, book_id`;
+
+    const result = await db.executeQuery(query, values);
+    const rows = toRows(result);
+    if (!rows.length) return res.status(500).json({ success: false, message: 'Failed to update review' });
+
+    const review = rows[0];
+
+    // Recalculate book aggregates
+    try {
+      await db.executeQuery(`UPDATE books SET avg_rating = (SELECT ROUND(AVG(rating)::numeric, 2) FROM reviews WHERE book_id::text = $1::text), rating_count = (SELECT COUNT(*) FROM reviews WHERE book_id::text = $1::text) WHERE id::text = $1::text`, [review.book_id]);
+    } catch (_) { /* ignore */ }
+
+    res.json({ success: true, data: { id: review.id, rating: review.rating, body: review.body, created_at: review.created_at, updated_at: review.updated_at } });
+  } catch (error) {
+    console.error('Error updating review:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// DELETE /reviews/:id - Delete a review (only owner)
+exports.deleteReview = async (req, res) => {
+  try {
+    const reviewId = req.params.reviewId;
+    const firebase_uid = req.user?.uid;
+
+    if (!firebase_uid) return res.status(401).json({ success: false, message: 'User not authenticated' });
+    if (!isUuidLike(reviewId)) return res.status(400).json({ success: false, message: 'Invalid review id' });
+
+    const userResult = await db.executeQuery('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
+    const userRows = toRows(userResult);
+    if (!userRows.length) return res.status(404).json({ success: false, message: 'User not found' });
+    const user_id = userRows[0].id;
+
+    const reviewRows = toRows(await db.executeQuery('SELECT id, user_id, book_id FROM reviews WHERE id = $1', [reviewId]));
+    if (!reviewRows.length) return res.status(404).json({ success: false, message: 'Review not found' });
+    if (String(reviewRows[0].user_id) !== String(user_id)) return res.status(403).json({ success: false, message: 'Forbidden' });
+
+    const bookId = reviewRows[0].book_id;
+
+    await db.executeQuery('DELETE FROM reviews WHERE id = $1', [reviewId]);
+
+    try {
+      await db.executeQuery(`UPDATE books SET avg_rating = (SELECT ROUND(AVG(rating)::numeric, 2) FROM reviews WHERE book_id::text = $1::text), rating_count = (SELECT COUNT(*) FROM reviews WHERE book_id::text = $1::text) WHERE id::text = $1::text`, [bookId]);
+    } catch (_) { /* ignore */ }
+
+    res.json({ success: true, message: 'Review deleted' });
+  } catch (error) {
+    console.error('Error deleting review:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// GET /books - List all books dengan pagination & filters
+exports.getBooks = async (req, res) => {
+  return listBooks(req, res, { includeInactive: false });
+};
+
+exports.getBooksAdmin = async (req, res) => {
+  return listBooks(req, res, { includeInactive: true });
+};
+
+// GET /books/:id/access - Validate reader access without streaming file content
+exports.getBookReadAccess = async (req, res) => {
+  try {
+    const { id: bookId } = req.params;
+    const access = await resolveActiveLoanAccess(req.user?.uid, bookId);
+
+    if (!access.allowed) {
+      return res.status(access.statusCode).json({
+        success: false,
+        can_read: false,
+        message: access.message,
+      });
+    }
+
+    const sessionRows = toRows(
+      await db.executeQuery(
+        `SELECT id, current_page, total_pages, progress_percentage, status,
+                last_read_at, started_at, finished_at, reading_time_minutes
+        FROM reading_sessions
+        WHERE user_id = $1 AND book_id = $2
+        ORDER BY last_read_at DESC, started_at DESC
+        LIMIT 1`,
+        [access.userId, bookId]
+      )
+    );
+
+    const session = sessionRows[0] || null;
+
+    return res.json({
+      success: true,
+      can_read: true,
+      due_date: access.dueDate || null,
+      current_page: Number(session?.current_page || 1),
+      total_pages: Number(session?.total_pages || 0),
+      progress_percentage: Number(session?.progress_percentage || 0),
+      reading_session_id: session?.id ? String(session.id) : null,
+      session: session
+      ? {
+          id: String(session.id),
+          current_page: Number(session.current_page || 1),
+          total_pages: Number(session.total_pages || 0),
+          progress_percentage: Number(session.progress_percentage || 0),
+          status: session.status,
+          last_read_at: session.last_read_at || null,
+          started_at: session.started_at || null,
+          finished_at: session.finished_at || null,
+          reading_time_minutes: Number(session.reading_time_minutes || 0),
+        }
+      : null,
+    });
+  } catch (error) {
+    console.error('Error validating book read access:', error.message);
+    return res.status(500).json({ success: false, can_read: false, message: 'Failed to validate access' });
+  }
+};
+
+// GET /books/genres - Get unique genre list for browse category
+exports.getGenres = async (_req, res) => {
+  try {
+    const result = await db.executeQuery(
+      'SELECT genres FROM books WHERE is_active = true AND genres IS NOT NULL'
+    );
+    const rows = toRows(result);
+
+    const unique = new Map();
+    for (const row of rows) {
+      const genres = parseGenresCell(row?.genres);
+      for (const genre of genres) {
+        const normalized = genre.trim();
+        if (!normalized) continue;
+        const key = normalized.toLowerCase();
+        if (!unique.has(key)) {
+          unique.set(key, normalized);
+        }
+      }
+    }
+
+    const data = Array.from(unique.values()).sort((a, b) => a.localeCompare(b, 'id'));
+
+    res.json({
+      success: true,
+      data,
+    });
+  } catch (error) {
+    console.error('Error fetching genres:', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -189,40 +795,19 @@ exports.searchBooks = async (req, res) => {
 
     const searchQuery = `%${q}%`;
     const query = `
-      SELECT id, title, authors, genres, avg_rating, cover_id, isbn, year, pages, description, file_url
-      FROM books 
-      WHERE is_active = true 
+      SELECT id, title, authors, genres, avg_rating, cover_url
+      FROM books
+      WHERE is_active = true
       AND (title ILIKE $1 OR authors::text ILIKE $1)
-      ORDER BY avg_rating DESC, created_at DESC
       LIMIT $2
     `;
 
     const result = await db.executeQuery(query, [searchQuery, limit]);
-
-    // Build cover URL from cover_id or ISBN
-    const booksData = result.rows.map(book => ({
-      id: book.id,
-      title: book.title,
-      authors: book.authors,
-      genres: book.genres,
-      avg_rating: parseFloat(book.avg_rating),
-      cover_id: book.cover_id,
-      cover_url: book.cover_id 
-        ? `https://covers.openlibrary.org/b/id/${book.cover_id}-M.jpg`
-        : book.isbn
-          ? `https://covers.openlibrary.org/b/isbn/${book.isbn.replace(/[-\s]/g, '')}-M.jpg`
-          : getPlaceholderCover(book.title),
-      isbn: book.isbn,
-      year: book.year,
-      pages: book.pages,
-      description: book.description,
-      file_url: book.file_url ? getBookFileEndpoint(req, book.id) : null
-    }));
+    const rows = toRows(result);
 
     res.json({
       success: true,
-      data: booksData,
-      count: booksData.length
+      data: rows
     });
   } catch (error) {
     console.error('Error searching books:', error.message);
@@ -235,30 +820,60 @@ exports.getBookDetail = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const query = 'SELECT * FROM books WHERE id = $1 AND is_active = true';
-    const result = await db.executeQuery(query, [id]);
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Book not found' });
+    if (!isUuidLike(id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid book id format',
+        error: {
+          code: 'INVALID_BOOK_ID',
+          id,
+        },
+      });
     }
 
-    const book = result.rows[0];
-    // Keep actual file URL for PDF viewer
-    // file_url is already set to http://localhost:3000/uploads/{filename}
-    
-    console.log('[DEBUG] getBookDetail returning:', {
-      id: book.id,
-      title: book.title,
-      avg_rating: book.avg_rating,
-      rating_count: book.rating_count,
-    });
+    const query = `
+      SELECT
+        b.*,
+        COALESCE(review_stats.review_avg_rating, 0) AS review_avg_rating,
+        COALESCE(review_stats.review_rating_count, 0) AS review_rating_count,
+        COALESCE(review_stats.review_count, 0) AS review_count
+      FROM books b
+      LEFT JOIN (
+        SELECT
+          book_id,
+          COUNT(*) AS review_count,
+          SUM(CASE WHEN rating IS NOT NULL THEN 1 ELSE 0 END) AS review_rating_count,
+          ROUND(COALESCE(AVG(CAST(rating AS DECIMAL(10, 2))), 0), 2) AS review_avg_rating
+        FROM reviews
+        GROUP BY book_id
+      ) review_stats ON review_stats.book_id = b.id
+      WHERE b.id = $1 AND b.is_active = true
+      LIMIT 1
+    `;
+    const result = await db.executeQuery(query, [id]);
+    const rows = toRows(result);
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Book not found',
+        error: {
+          code: 'BOOK_NOT_FOUND',
+          id,
+        },
+      });
+    }
+
+    const normalizedBook = normalizeBookRow(rows[0]);
+    const queueCount = await getQueueCountByBookId(id);
+    const book = {
+      ...withDownloadUrl(normalizedBook, req),
+      queue: queueCount,
+    };
 
     res.json({
       success: true,
-      data: {
-        ...book,
-        file_url: book.file_url ? getBookFileEndpoint(req, book.id) : null,
-      }
+      data: book
     });
   } catch (error) {
     console.error('Error fetching book detail:', error.message);
@@ -266,156 +881,208 @@ exports.getBookDetail = async (req, res) => {
   }
 };
 
-// DEBUG ENDPOINT: Get raw database values for a book
-exports.getBookDebug = async (req, res) => {
+// GET /books/:id/similar - MVP similar books by genre/author
+exports.getSimilarBooks = async (req, res) => {
   try {
     const { id } = req.params;
-    const pool = require('../config/database').getPool();
 
-    // Get book with stats
-    const bookQuery = 'SELECT id, title, avg_rating, rating_count FROM books WHERE id = $1';
-    const bookResult = await pool.query(bookQuery, [id]);
-
-    if (bookResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Book not found' });
-    }
-
-    // Get reviews count and avg from reviews table directly
-    const statsQuery = `
-      SELECT 
-        COUNT(*) as review_count,
-        ROUND(AVG(rating)::numeric, 2) as avg_from_reviews
-      FROM reviews
-      WHERE book_id = $1
-    `;
-    const statsResult = await pool.query(statsQuery, [id]);
-
-    const book = bookResult.rows[0];
-    const stats = statsResult.rows[0];
-
-    console.log('[DEBUG] Book stats comparison:', {
-      from_books_table: { avg_rating: book.avg_rating, rating_count: book.rating_count },
-      from_reviews_table: { avg: stats.avg_from_reviews, count: stats.review_count }
-    });
-
-    res.json({
-      success: true,
-      data: {
-        book_stats: {
-          id: book.id,
-          title: book.title,
-          avg_rating: parseFloat(book.avg_rating) || 0,
-          rating_count: parseInt(book.rating_count) || 0,
-        },
-        calculated_from_reviews: {
-          avg: parseFloat(stats.avg_from_reviews) || 0,
-          count: parseInt(stats.review_count) || 0,
-        },
-        match: book.avg_rating == stats.avg_from_reviews && book.rating_count == stats.review_count
-      }
-    });
-  } catch (error) {
-    console.error('Error getting book debug:', error.message);
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// GET /books/:id/file - Stream PDF file for reader (starts reading session)
-exports.downloadBookFile = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const userId = req.user?.uid; // From auth middleware
-
-    // Get book from database
-    const query = 'SELECT id, title, pages, file_url, file_type FROM books WHERE id = $1';
-    const result = await db.executeQuery(query, [id]);
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Book not found' });
-    }
-
-    const book = result.rows[0];
-
-    if (!book.file_url) {
-      return res.status(404).json({ success: false, message: 'Book file not available' });
-    }
-
-    // If user authenticated, log reading session (fire and forget)
-    if (userId) {
-      setImmediate(async () => {
-        try {
-          const { getPool } = require('../config/database');
-          const pool = getPool();
-          
-          // Check if user has active session for this book
-          const sessionCheck = await pool.query(
-            'SELECT id FROM reading_sessions WHERE user_id = $1 AND book_id = $2 AND status = $3',
-            [userId, id, 'reading']
-          );
-
-          if (sessionCheck.rows.length === 0) {
-            // Create new reading session
-            await pool.query(
-              `INSERT INTO reading_sessions (user_id, book_id, total_pages, status, started_at)
-               VALUES ($1, $2, $3, $4, NOW())`,
-              [userId, id, book.pages || 0, 'reading']
-            );
-            console.log(`✅ Started reading session for user ${userId} on book ${book.title}`);
-          }
-        } catch (sessionError) {
-          console.warn('⚠️  Could not create reading session:', sessionError.message);
-        }
+    if (!isUuidLike(id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid book id format',
+        error: { code: 'INVALID_BOOK_ID', id },
       });
     }
 
-    // Extract filename from URL (e.g., "http://localhost:3000/uploads/uuid-time.pdf" -> "uuid-time.pdf")
-    const fileName = book.file_url.split('/').pop();
+    const seedResult = await db.executeQuery(
+      'SELECT id, authors, genres FROM books WHERE id = $1 AND is_active = true',
+      [id]
+    );
+    const seedRows = toRows(seedResult);
 
-    if (!fileName) {
-      return res.status(400).json({ success: false, message: 'Invalid file URL' });
+    if (seedRows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Book not found',
+        error: { code: 'BOOK_NOT_FOUND', id },
+      });
     }
 
-    const supabasePublicUrl = getSupabasePublicUrl(book.file_url);
+    const seed = seedRows[0];
+    const genres = parseGenresCell(seed.genres);
+    const authors = parseGenresCell(seed.authors);
 
-    try {
-      if (supabasePublicUrl) {
-        const remoteResponse = await fetch(supabasePublicUrl);
+    const conditions = [];
+    const params = [id];
 
-        if (!remoteResponse.ok) {
-          throw new Error(`Remote PDF returned ${remoteResponse.status}`);
-        }
-
-        res.status(remoteResponse.status);
-        res.setHeader('Content-Type', remoteResponse.headers.get('content-type') || book.file_type || 'application/pdf');
-        res.setHeader('Content-Disposition', `inline; filename="${book.title}.pdf"`);
-        await pipeRemotePdf(remoteResponse, res);
-        return;
-      }
-
-      // Stream file from local storage
-      const stream = await storage.downloadFile(fileName);
-      res.setHeader('Content-Type', book.file_type || 'application/pdf');
-      res.setHeader('Content-Disposition', `inline; filename="${book.title}.pdf"`);
-      stream.pipe(res);
-    } catch (streamError) {
-      console.error('Error streaming file:', streamError.message);
-      return res.status(500).json({ success: false, message: 'Could not stream file' });
+    for (const genre of genres.slice(0, 4)) {
+      conditions.push(`$${params.length + 1} = ANY(genres)`);
+      params.push(genre);
     }
+
+    for (const author of authors.slice(0, 2)) {
+      conditions.push(`authors::text ILIKE $${params.length + 1}`);
+      params.push(`%${author}%`);
+    }
+
+    const whereSimilar = conditions.length > 0 ? `AND (${conditions.join(' OR ')})` : '';
+    const similarQuery = `
+      SELECT *
+      FROM books
+      WHERE is_active = true
+        AND id <> $1
+        ${whereSimilar}
+      ORDER BY avg_rating DESC, created_at DESC
+      LIMIT 5
+    `;
+
+    const similarResult = await db.executeQuery(similarQuery, params);
+    const similarRows = toRows(similarResult).map((book) => withDownloadUrl(book, req));
+
+    res.json({
+      success: true,
+      data: similarRows,
+      meta: {
+        source_book_id: id,
+        total: similarRows.length,
+      },
+    });
   } catch (error) {
-    console.error('Error downloading book file:', error.message);
+    console.error('Error fetching similar books:', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 };
 
+// GET /books/:id/file
+exports.downloadBookFile = async (req, res) => {
+  try {
+    const { id: bookId } = req.params;
+    const access = await resolveActiveLoanAccess(req.user?.uid, bookId);
+    if (!access.allowed) {
+      return res.status(access.statusCode).json({ success: false, message: access.message });
+    }
+    const userId = access.userId;
+
+    // 3. AMBIL METADATA BUKU
+    const bookRows = toRows(await db.executeQuery(
+      'SELECT id, title, file_url, file_type FROM books WHERE id = $1 AND is_active = true',
+      [bookId]
+    ));
+    const book = bookRows[0];
+
+    if (!book || !book.file_url) {
+      return res.status(404).json({ success: false, message: 'File buku ga ketemu atau emang ga ada.' });
+    }
+
+    // 4. RAKIT URL SUPABASE (handle path maupun URL full)
+    const supabaseUrl = process.env.SUPABASE_URL || 'https://ojlrymmikhdfqzuycldm.supabase.co';
+    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+    if (!serviceKey) {
+      console.error("❌ SUPABASE_SERVICE_ROLE_KEY undefined (backend)!");
+    }
+
+    let filePath = book.file_url;
+    if (filePath.startsWith('http')) {
+      const parts = filePath.split('/pustara-storage/');
+      filePath = parts.length > 1 ? parts[1] : filePath;
+    }
+
+    const finalUrl = `${supabaseUrl}/storage/v1/object/pustara-storage/${filePath}`;
+
+    console.log(`Secure read access granted for user ${userId} and book ${bookId}`);
+    console.log(`📂 Resolved file path: ${filePath}`);
+    console.log(`🔗 Final Supabase URL: ${finalUrl}`);
+
+    // 5. Fetch file bytes from Supabase storage.
+    const response = await fetch(finalUrl, {
+      headers: { 'Authorization': `Bearer ${serviceKey}` }
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => '');
+      console.error(`❌ Storage Error (${response.status}): ${errorBody}`);
+      return res.status(response.status).json({ success: false, message: 'Gagal ambil file dari storage.' });
+    }
+
+    // 6. Stream PDF response to browser using Readable.fromWeb.
+    res.setHeader('Content-Type', book.file_type || 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(book.title)}.pdf"`);
+
+    if (!response.body) {
+      return res.status(502).json({ success: false, message: 'Storage response body is empty' });
+    }
+
+    Readable.fromWeb(response.body).pipe(res);
+
+  } catch (error) {
+    console.error('Error in downloadBookFile:', error.message);
+    res.status(500).json({ success: false, message: 'Server error while streaming book file' });
+  }
+};
+
+// GET /admin/books/:id/file
 exports.downloadBookFileAdmin = async (req, res) => {
-  return exports.downloadBookFile(req, res);
+  try {
+    const { id: bookId } = req.params;
+
+    const bookRows = toRows(await db.executeQuery(
+      'SELECT id, title, file_url, file_type FROM books WHERE id = $1 AND is_active = true',
+      [bookId]
+    ));
+    const book = bookRows[0];
+
+    if (!book || !book.file_url) {
+      return res.status(404).json({ success: false, message: 'File buku ga ketemu atau emang ga ada.' });
+    }
+
+    const supabaseUrl = process.env.SUPABASE_URL || 'https://ojlrymmikhdfqzuycldm.supabase.co';
+    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+    if (!serviceKey) {
+      console.error('❌ SUPABASE_SERVICE_ROLE_KEY undefined (backend)!');
+    }
+
+    let filePath = book.file_url;
+    if (filePath.startsWith('http')) {
+      const parts = filePath.split('/pustara-storage/');
+      filePath = parts.length > 1 ? parts[1] : filePath;
+    }
+
+    // Try authenticated endpoint first, fall back to public
+    const finalUrl = `${supabaseUrl}/storage/v1/object/pustara-storage/${filePath}`;
+
+    const response = await fetch(finalUrl, {
+      headers: { Authorization: `Bearer ${serviceKey}` },
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => '');
+      console.error(`❌ Admin Storage Error (${response.status}): ${errorBody}`);
+      console.error(`📂 file_url from DB: ${book.file_url}`);
+      console.error(`🔗 Final URL: ${finalUrl}`);
+      return res.status(response.status).json({ success: false, message: 'Gagal ambil file dari storage.' });
+    }
+
+    res.setHeader('Content-Type', book.file_type || 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(book.title)}.pdf"`);
+
+    if (!response.body) {
+      return res.status(502).json({ success: false, message: 'Storage response body is empty' });
+    }
+
+    Readable.fromWeb(response.body).pipe(res);
+  } catch (error) {
+    console.error('Error in downloadBookFileAdmin:', error.message);
+    res.status(500).json({ success: false, message: 'Server error while streaming book file' });
+  }
 };
 
 // POST /books - Admin: Create new book (dengan file upload)
 exports.createBook = async (req, res) => {
   try {
     const { title, description, year, pages, language } = req.body;
-    let { authors, genres } = req.body;
+    let { authors, genres, total_stock, available } = req.body;
     const file = req.files?.bookFile;
 
     // Validation
@@ -423,26 +1090,24 @@ exports.createBook = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Title is required' });
     }
 
-    // Parse authors - accept string or array
-    if (typeof authors === 'string') {
-      authors = authors.split(',').map(a => a.trim()).filter(a => a);
-    }
+    authors = parseArrayCell(authors);
     if (!Array.isArray(authors) || authors.length === 0) {
       return res.status(400).json({ success: false, message: 'Authors is required (comma-separated or array)' });
     }
 
-    // Parse genres - accept string or array
-    if (typeof genres === 'string') {
-      genres = genres.split(',').map(g => g.trim()).filter(g => g);
-    }
+    genres = parseArrayCell(genres);
     if (!Array.isArray(genres) || genres.length === 0) {
       return res.status(400).json({ success: false, message: 'Genres is required (comma-separated or array)' });
     }
 
+    const totalStockValue = parseOptionalNumberCell(total_stock) ?? 5;
+    const availableValue = parseOptionalNumberCell(available) ?? totalStockValue;
+
     let fileUrl = null;
+    let fileSize = null;
     let fileType = 'application/pdf';
 
-    // Upload file to local storage
+    // Upload file to Azure Blob jika ada
     if (file) {
       if (!['application/pdf', 'application/x-pdf'].includes(file.mimetype)) {
         return res.status(400).json({ success: false, message: 'Only PDF files are allowed' });
@@ -450,38 +1115,20 @@ exports.createBook = async (req, res) => {
 
       fileType = file.mimetype;
       const fileName = `${uuidv4()}-${Date.now()}.pdf`;
-      
+
       try {
-        // Read file data (handle both temp file and in-memory data)
-        let fileBuffer;
-        if (file.tempFilePath) {
-          // If using temp files, read from disk
-          const fs = require('fs');
-          fileBuffer = fs.readFileSync(file.tempFilePath);
-        } else {
-          // Fallback to in-memory data
-          fileBuffer = file.data;
-        }
-
-        // Check file size
-        if (!fileBuffer || fileBuffer.length === 0) {
-          return res.status(400).json({ success: false, message: 'PDF file is empty (0 bytes)' });
-        }
-
-        // PRODUCTION: Upload to Azure Blob
-        // fileUrl = await azureBlob.uploadFile(fileName, file.data, fileType);
-        // DEVELOPMENT: Upload to local storage
-        fileUrl = await storage.uploadFile(fileName, fileBuffer, fileType);
+        fileUrl = await azureBlob.uploadFile(fileName, file.data, fileType);
+        fileSize = file.size;
       } catch (uploadError) {
-        console.error('Storage upload error:', uploadError.message);
+        console.error('Azure upload error:', uploadError.message);
         return res.status(500).json({ success: false, message: 'Failed to upload file to storage' });
       }
     }
 
     const pool = require('../config/database').getPool();
     const query = `
-      INSERT INTO books (title, authors, genres, description, "year", pages, language, file_url, file_type, is_active)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)
+      INSERT INTO books (title, authors, genres, description, "year", pages, isbn, language, file_url, file_size, file_type, total_stock, available, is_active)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true)
       RETURNING *
     `;
 
@@ -492,15 +1139,55 @@ exports.createBook = async (req, res) => {
       description || null,
       year ? parseInt(year) : null,
       pages ? parseInt(pages) : null,
+      req.body.isbn?.trim() || null,
       language || 'id',
       fileUrl,
-      fileType
+      fileSize,
+      fileType,
+      totalStockValue,
+      availableValue
     ]);
+
+    const createdBook = normalizeBookRow(result.rows[0]);
+
+    // Notify users about newly uploaded books.
+    try {
+      const users = await getAllNotifiableUsers();
+      const titleSafe = String(createdBook?.title || title || 'Buku baru');
+      const yearSafe = createdBook?.year ? ` (${createdBook.year})` : '';
+
+      await Promise.all(users.map(async (user) => {
+        await insertNotification({
+          userId: user.id,
+          type: 'system',
+          title: 'Buku Baru di Pustara',
+          body: `\"${titleSafe}\"${yearSafe} baru saja ditambahkan ke katalog Pustara.`,
+          bookId: createdBook?.id || null,
+        });
+
+        try {
+          await sendEmail({
+            to: user.email,
+            subject: 'Pustara - Buku Baru Telah Ditambahkan',
+            text: [
+              `Halo ${user.name || 'Pustara Reader'},`,
+              '',
+              `Ada buku baru di katalog: \"${titleSafe}\"${yearSafe}.`,
+              'Yuk buka Pustara dan cek buku terbaru sekarang.',
+            ].join('\n'),
+          });
+        } catch (mailError) {
+          console.warn('New-book email warning:', mailError.message);
+        }
+      }));
+    } catch (notifyError) {
+      console.warn('New-book broadcast warning:', notifyError.message);
+    }
 
     res.status(201).json({
       success: true,
       message: 'Book created successfully',
-      data: result.rows[0]
+      data: createdBook
     });
   } catch (error) {
     console.error('Error creating book:', error.message);
@@ -512,35 +1199,43 @@ exports.createBook = async (req, res) => {
 exports.updateBook = async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, authors, genres, description, year, pages, is_active } = req.body;
+    // Ambil file_url dari body (dikirim dari upload-book page)
+    const { title, authors: rawAuthors, genres: rawGenres, description, year, pages, isbn,
+      is_active, file_url, total_stock, available } = req.body;
+
+    const authors = rawAuthors == null || rawAuthors === '' ? null : parseArrayCell(rawAuthors);
+    const genres = rawGenres == null || rawGenres === '' ? null : parseArrayCell(rawGenres);
 
     const query = `
-      UPDATE books 
+      UPDATE books
       SET title = COALESCE($1, title),
           authors = COALESCE($2, authors),
           genres = COALESCE($3, genres),
           description = COALESCE($4, description),
           "year" = COALESCE($5, "year"),
           pages = COALESCE($6, pages),
-          is_active = COALESCE($7, is_active),
+          isbn = COALESCE($7, isbn),
+          is_active = COALESCE($8, is_active),
+          file_url = COALESCE($9, file_url),
+          total_stock = COALESCE($10, total_stock),
+          available = COALESCE($11, available),
           updated_at = now()
-      WHERE id = $8
+      WHERE id = $12
       RETURNING *
     `;
 
     const result = await db.executeQuery(query, [
-      title, authors, genres, description, year, pages, is_active, id
+      title, authors, genres, description, year, pages, isbn?.trim() || null, is_active,
+      file_url || null,
+      parseOptionalNumberCell(total_stock),
+      parseOptionalNumberCell(available),
+      id
     ]);
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Book not found' });
-    }
+    const rows = toRows(result);
+    if (rows.length === 0) return res.status(404).json({ success: false, message: 'Book not found' });
 
-    res.json({
-      success: true,
-      message: 'Book updated successfully',
-      data: result.rows[0]
-    });
+    res.json({ success: true, message: 'Book updated successfully', data: normalizeBookRow(rows[0]) });
   } catch (error) {
     console.error('Error updating book:', error.message);
     res.status(500).json({ success: false, message: error.message });
@@ -553,16 +1248,30 @@ exports.deleteBook = async (req, res) => {
     const { id } = req.params;
 
     const query = `
-      UPDATE books 
+      UPDATE books
       SET is_active = false, updated_at = now()
       WHERE id = $1
       RETURNING *
     `;
 
     const result = await db.executeQuery(query, [id]);
+    const rows = toRows(result);
 
-    if (result.rows.length === 0) {
+    if (rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Book not found' });
+    }
+
+    try {
+      const deleted = rows[0] || {};
+      const actor = req.user?.uid || req.user?.email || 'unknown';
+      await sendOpsAlert('Pustara Soft Delete Book', [
+        `Actor: ${actor}`,
+        `Book ID: ${deleted.id || id}`,
+        `Title: ${deleted.title || '-'}`,
+        `is_active set to false`,
+      ]);
+    } catch (alertError) {
+      console.warn('Delete alert email failed:', alertError.message);
     }
 
     res.json({
@@ -575,959 +1284,138 @@ exports.deleteBook = async (req, res) => {
   }
 };
 
-// GET /books/trending - Get trending books for homepage
-exports.getTrendingBooks = async (req, res) => {
-  try {
-    const { limit = 10 } = req.query;
-    const limitNum = Math.min(parseInt(limit) || 10, 50); // Cap at 50
-
-    // Check if database is initialized
-    if (!db || typeof db.executeQuery !== 'function') {
-      console.error('❌ Database not initialized for getTrendingBooks');
-      return res.status(503).json({ 
-        success: false, 
-        message: 'Database service unavailable. Please restart the server.' 
-      });
-    }
-
-    // Simple query: rank by avg_rating and recency
-    // TODO: Add reading_sessions table to schema when ready for activity-based trending
-    const query = `
-      SELECT 
-        b.id,
-        b.title,
-        b.authors,
-        b.genres,
-        b.description,
-        b.year,
-        b.pages,
-        b.isbn,
-        b.cover_id,
-        b.avg_rating,
-        b.rating_count,
-        b.file_url,
-        b.created_at,
-        ROUND((COALESCE(b.avg_rating, 0) * 10)::numeric)::int as trending_score
-      FROM books b
-      WHERE b.is_active = true
-      ORDER BY b.avg_rating DESC, b.created_at DESC
-      LIMIT $1
-    `;
-
-    const result = await db.executeQuery(query, [limitNum]);
-
-    // Build cover URL from cover_id or ISBN
-    const booksData = result.rows.map(book => ({
-      id: book.id,
-      title: book.title,
-      authors: book.authors,
-      genres: book.genres,
-      description: book.description,
-      year: book.year,
-      pages: book.pages,
-      isbn: book.isbn,
-      cover_id: book.cover_id,
-      cover_url: book.cover_id 
-        ? `https://covers.openlibrary.org/b/id/${book.cover_id}-M.jpg`
-        : book.isbn
-          ? `https://covers.openlibrary.org/b/isbn/${book.isbn.replace(/[-\s]/g, '')}-M.jpg`
-          : getPlaceholderCover(book.title),
-      avg_rating: parseFloat(book.avg_rating) || 0,
-      rating_count: parseInt(book.rating_count) || 0,
-      file_url: book.file_url ? getBookFileEndpoint(req, book.id) : null,
-      trending_score: parseInt(book.trending_score) || 0
-    }));
-
-    res.json({
-      success: true,
-      data: booksData,
-      count: booksData.length
-    });
-  } catch (error) {
-    console.error('Error fetching trending books:', error.message);
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-exports.getRecentBooks = exports.getTrendingBooks;
-
-exports.getTopPicks = exports.getTrendingBooks;
-
-exports.getSimilarBooks = async (req, res) => {
+// DELETE /books/:id/permanent - Admin: Permanently remove book and related rows
+exports.deleteBookPermanent = async (req, res) => {
   try {
     const { id } = req.params;
-    const limit = Math.min(Number(req.query.limit) || 6, 20);
 
     const query = `
-      SELECT id, title, authors, genres, avg_rating, cover_id, isbn, year, pages, description, file_url
-      FROM books
-      WHERE is_active = true AND id <> $1
-      ORDER BY avg_rating DESC, created_at DESC
-      LIMIT $2
+      DELETE FROM books
+      WHERE id = $1
+      RETURNING *
     `;
 
-    const result = await db.executeQuery(query, [id, limit]);
-    const booksData = result.rows.map(book => ({
-      id: book.id,
-      title: book.title,
-      authors: book.authors,
-      genres: book.genres,
-      avg_rating: parseFloat(book.avg_rating) || 0,
-      cover_id: book.cover_id,
-      cover_url: book.cover_id
-        ? `https://covers.openlibrary.org/b/id/${book.cover_id}-M.jpg`
-        : book.isbn
-          ? `https://covers.openlibrary.org/b/isbn/${book.isbn.replace(/[-\s]/g, '')}-M.jpg`
-          : getPlaceholderCover(book.title),
-      isbn: book.isbn,
-      year: book.year,
-      pages: book.pages,
-      description: book.description,
-      file_url: book.file_url ? getBookFileEndpoint(req, book.id) : null,
-    }));
-
-    res.json({ success: true, data: booksData });
-  } catch (error) {
-    console.error('Error fetching similar books:', error.message);
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-exports.getBookReadAccess = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const query = 'SELECT id, pages FROM books WHERE id = $1 AND is_active = true';
     const result = await db.executeQuery(query, [id]);
+    const rows = toRows(result);
 
-    if (result.rows.length === 0) {
+    if (rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Book not found' });
     }
 
-    const book = result.rows[0];
-    const dueDate = new Date();
-    dueDate.setDate(dueDate.getDate() + 7);
+    try {
+      const deleted = rows[0] || {};
+      const actor = req.user?.uid || req.user?.email || 'unknown';
+      await sendOpsAlert('Pustara Permanent Delete Book', [
+        `Actor: ${actor}`,
+        `Book ID: ${deleted.id || id}`,
+        `Title: ${deleted.title || '-'}`,
+        'Book row deleted from database',
+      ]);
+    } catch (alertError) {
+      console.warn('Permanent delete alert failed:', alertError.message);
+    }
 
     res.json({
       success: true,
-      allowed: true,
-      current_page: 1,
-      due_date: dueDate.toISOString(),
-      session: null,
-      book_id: book.id,
-      total_pages: Number(book.pages) || 0,
+      message: 'Book permanently deleted successfully'
     });
   } catch (error) {
-    console.error('Error getting book access:', error.message);
+    console.error('Error permanently deleting book:', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 };
 
-exports.getBooksAdmin = exports.getBooks;
-
+// GET /books/without-file - Admin: Get books without pdf file
 exports.getBooksWithoutFile = async (req, res) => {
   try {
     const query = `
-      SELECT id, title, authors, genres, description, year, pages, isbn, language, total_stock, available, is_active, avg_rating, cover_id, file_url, file_type, created_at, updated_at
+      SELECT id, title, authors, genres, description, "year", pages, isbn, language, total_stock, available
       FROM books
-      WHERE file_url IS NULL OR file_url = ''
-      ORDER BY created_at DESC
+      WHERE file_url IS NULL AND is_active = true
+      ORDER BY title ASC
     `;
-
     const result = await db.executeQuery(query, []);
-    res.json({ success: true, data: result.rows || [] });
+    const rows = toRows(result);
+    res.json({ success: true, data: rows });
   } catch (error) {
     console.error('Error fetching books without file:', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 };
 
-exports.setTopPicks = async (_req, res) => {
-  return res.json({ success: true, message: 'Top picks endpoint is available' });
-};
-
-exports.deleteBookPermanent = exports.deleteBook;
-
-// GET /genres - List available genres
-exports.getGenres = async (req, res) => {
-  const genres = [
-    'Fiksi',
-    'Sastra',
-    'Sejarah',
-    'Sains',
-    'Biografi',
-    'Romansa',
-    'Misteri',
-    'Teknologi',
-    'Pendidikan',
-    'Filsafat',
-    'Psikologi',
-    'Seni',
-    'Agama',
-    'Ekonomi',
-    'Politik',
-    'Olahraga'
-  ];
-  res.json({ success: true, data: genres });
-};
-
-// DEVELOPMENT ONLY: GET /upload-book - Simple HTML upload form
-exports.getUploadForm = async (req, res) => {
-  const html = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title> Upload Buku - Pustara</title>
-  <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-    
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-    }
-    
-    .container {
-      background: white;
-      border-radius: 10px;
-      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-      max-width: 500px;
-      width: 100%;
-      padding: 40px;
-    }
-    
-    h1 {
-      color: #333;
-      margin-bottom: 10px;
-      font-size: 28px;
-    }
-    
-    .subtitle {
-      color: #666;
-      margin-bottom: 30px;
-      font-size: 14px;
-    }
-    
-    .form-group {
-      margin-bottom: 20px;
-    }
-    
-    label {
-      display: block;
-      color: #333;
-      font-weight: 600;
-      margin-bottom: 8px;
-      font-size: 14px;
-    }
-    
-    input[type="text"],
-    textarea {
-      width: 100%;
-      padding: 12px;
-      border: 2px solid #e0e0e0;
-      border-radius: 6px;
-      font-size: 14px;
-      font-family: inherit;
-      transition: border-color 0.3s;
-    }
-    
-    input[type="text"]:focus,
-    textarea:focus {
-      outline: none;
-      border-color: #667eea;
-    }
-    
-    .file-upload {
-      position: relative;
-      border: 2px dashed #667eea;
-      border-radius: 6px;
-      padding: 30px;
-      text-align: center;
-      cursor: pointer;
-      transition: all 0.3s;
-      background: #f8f9fa;
-    }
-    
-    .file-upload:hover {
-      border-color: #764ba2;
-      background: #f0f0f0;
-    }
-    
-    .file-upload.dragover {
-      border-color: #764ba2;
-      background: #e8e8ff;
-    }
-    
-    .file-upload input[type="file"] {
-      display: none;
-    }
-    
-    .file-icon {
-      font-size: 32px;
-      margin-bottom: 10px;
-    }
-    
-    .file-text {
-      color: #666;
-      font-size: 14px;
-    }
-    
-    .file-name {
-      color: #333;
-      font-weight: 600;
-      margin-top: 10px;
-      font-size: 13px;
-    }
-    
-    button {
-      width: 100%;
-      padding: 12px;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
-      border: none;
-      border-radius: 6px;
-      font-size: 16px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: transform 0.2s;
-      margin-top: 10px;
-    }
-    
-    button:hover {
-      transform: translateY(-2px);
-    }
-    
-    button:active {
-      transform: translateY(0);
-    }
-    
-    .loading {
-      display: none;
-      text-align: center;
-      margin-top: 20px;
-    }
-    
-    .spinner {
-      display: inline-block;
-      width: 20px;
-      height: 20px;
-      border: 3px solid #f3f3f3;
-      border-top: 3px solid #667eea;
-      border-radius: 50%;
-      animation: spin 1s linear infinite;
-    }
-    
-    @keyframes spin {
-      0% { transform: rotate(0deg); }
-      100% { transform: rotate(360deg); }
-    }
-    
-    .message {
-      margin-top: 20px;
-      padding: 12px;
-      border-radius: 6px;
-      display: none;
-      font-size: 14px;
-    }
-    
-    .message.success {
-      background: #d4edda;
-      color: #155724;
-      border: 1px solid #c3e6cb;
-      display: block;
-    }
-    
-    .message.error {
-      background: #f8d7da;
-      color: #721c24;
-      border: 1px solid #f5c6cb;
-      display: block;
-    }
-    
-    .info {
-      background: #e7f3ff;
-      border: 1px solid #b3d9ff;
-      color: #004085;
-      padding: 12px;
-      border-radius: 6px;
-      margin-bottom: 20px;
-      font-size: 13px;
-      line-height: 1.5;
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>📚 Upload Buku</h1>
-    <p class="subtitle">Tambah buku baru ke Pustara</p>
-    
-    <div class="info">
-      ℹ️ <strong>Development Mode:</strong> Endpoint ini untuk testing. Di production, gunakan admin dashboard.
-    </div>
-    
-    <form id="uploadForm">
-      <div class="form-group">
-        <label for="title">📖 Judul Buku *</label>
-        <input type="text" id="title" placeholder="Contoh: Kalkulus I" required>
-      </div>
-      
-      <div class="form-group">
-        <label for="authors"> Penulis *</label>
-        <input type="text" id="authors" placeholder="Contoh: Purcell, Varberg (pisahkan dengan koma)" required>
-      </div>
-      
-      <div class="form-group">
-        <label for="genreSelect"> Genre *</label>
-        <div style="display: flex; gap: 10px; align-items: flex-start;">
-          <select id="genreSelect" style="flex: 1; padding: 12px; border: 2px solid #e0e0e0; border-radius: 6px; font-size: 14px; font-family: inherit;" required>
-            <option value="">-- Pilih Genre --</option>
-            <option value="Fiksi">Fiksi</option>
-            <option value="Sastra">Sastra</option>
-            <option value="Sejarah">Sejarah</option>
-            <option value="Sains">Sains</option>
-            <option value="Biografi">Biografi</option>
-            <option value="Romansa">Romansa</option>
-            <option value="Misteri">Misteri</option>
-            <option value="Teknologi">Teknologi</option>
-            <option value="Pendidikan">Pendidikan</option>
-            <option value="Filsafat">Filsafat</option>
-            <option value="Psikologi">Psikologi</option>
-            <option value="Seni">Seni</option>
-            <option value="Agama">Agama</option>
-            <option value="Ekonomi">Ekonomi</option>
-            <option value="Politik">Politik</option>
-            <option value="Olahraga">Olahraga</option>
-            <option value="__custom__">🔧 Yang Lain...</option>
-          </select>
-          <input type="text" id="genreCustom" placeholder="Genre lain" style="flex: 1; padding: 12px; border: 2px solid #e0e0e0; border-radius: 6px; font-size: 14px; font-family: inherit; display: none;">
-        </div>
-        <small style="color: #999; margin-top: 5px; display: block;">💡 Pilih dari list atau masukkan genre custom (bisa lebih dari 1, pisahkan dengan koma)</small>
-      </div>
-      
-      <div class="form-group">
-        <label for="isbn">📚 ISBN</label>
-        <input type="text" id="isbn" placeholder="Contoh: 978-9793061621 (opsional - untuk auto-fetch cover)" pattern="[0-9\-]*">
-        <small style="color: #999; margin-top: 5px; display: block;">💡 Masukkan ISBN untuk auto-fetch cover dari OpenLibrary</small>
-      </div>
-      
-      <div class="form-group">
-        <label for="description">📝 Deskripsi</label>
-        <textarea id="description" placeholder="Deskripsi singkat tentang buku (opsional)" rows="3" style="resize: vertical;"></textarea>
-      </div>
-      
-      <div class="form-group">
-        <label for="year">📅 Tahun</label>
-        <input type="text" id="year" placeholder="Contoh: 2023">
-      </div>
-      
-      <div class="form-group">
-        <label for="pages">📄 Jumlah Halaman</label>
-        <input type="text" id="pages" placeholder="Contoh: 450">
-      </div>
-      
-      <div class="form-group">
-        <label>📁 File PDF *</label>
-        <div class="file-upload" id="fileUpload">
-          <div class="file-icon">📄</div>
-          <div class="file-text">
-            Drag & drop file PDF di sini atau klik untuk browse
-          </div>
-          <div class="file-name" id="fileName"></div>
-          <input type="file" id="bookFile" accept=".pdf" required>
-        </div>
-      </div>
-      
-      <button type="submit">✨ Upload Buku</button>
-      
-      <div class="loading" id="loading">
-        <div class="spinner"></div>
-        <p style="margin-top: 10px; color: #666;">Uploading...</p>
-      </div>
-      
-      <div class="message" id="message"></div>
-    </form>
-  </div>
-
-  <script>
-    const form = document.getElementById('uploadForm');
-    const fileUpload = document.getElementById('fileUpload');
-    const fileInput = document.getElementById('bookFile');
-    const fileName = document.getElementById('fileName');
-    const loading = document.getElementById('loading');
-    const messageDiv = document.getElementById('message');
-    const genreSelect = document.getElementById('genreSelect');
-    const genreCustom = document.getElementById('genreCustom');
-    
-    // Genre dropdown handler
-    genreSelect.addEventListener('change', () => {
-      if (genreSelect.value === '__custom__') {
-        genreCustom.style.display = 'block';
-        genreCustom.required = true;
-        genreSelect.required = false;
-      } else {
-        genreCustom.style.display = 'none';
-        genreCustom.required = false;
-        genreSelect.required = true;
-      }
-    });
-
-    // File upload drag and drop
-    fileUpload.addEventListener('click', () => fileInput.click());
-    
-    fileUpload.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      fileUpload.classList.add('dragover');
-    });
-    
-    fileUpload.addEventListener('dragleave', () => {
-      fileUpload.classList.remove('dragover');
-    });
-    
-    fileUpload.addEventListener('drop', (e) => {
-      e.preventDefault();
-      fileUpload.classList.remove('dragover');
-      const files = e.dataTransfer.files;
-      if (files.length > 0) {
-        fileInput.files = files;
-        updateFileName();
-      }
-    });
-    
-    fileInput.addEventListener('change', updateFileName);
-    
-    function updateFileName() {
-      if (fileInput.files.length > 0) {
-        fileName.textContent = '✅ ' + fileInput.files[0].name;
-      } else {
-        fileName.textContent = '';
-      }
-    }
-    
-    // Form submission
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      
-      if (!fileInput.files.length) {
-        showMessage('❌ Pilih file PDF terlebih dahulu', 'error');
-        return;
-      }
-      
-      const formData = new FormData();
-      formData.append('title', document.getElementById('title').value);
-      formData.append('authors', document.getElementById('authors').value);
-      
-      // Handle genre: if custom selected, use custom input; otherwise use dropdown
-      let genreValue = genreSelect.value === '__custom__' 
-        ? genreCustom.value 
-        : genreSelect.value;
-      formData.append('genres', genreValue);
-      
-      formData.append('isbn', document.getElementById('isbn').value);
-      formData.append('description', document.getElementById('description').value);
-      formData.append('year', document.getElementById('year').value);
-      formData.append('pages', document.getElementById('pages').value);
-      formData.append('bookFile', fileInput.files[0]);
-      
-      loading.style.display = 'block';
-      messageDiv.style.display = 'none';
-      
-      try {
-        const response = await fetch('/books/upload-dev', {
-          method: 'POST',
-          body: formData
-        });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-          showMessage('✅ Buku berhasil diupload!', 'success');
-          form.reset();
-          fileName.textContent = '';
-          setTimeout(() => {
-            messageDiv.style.display = 'none';
-          }, 3000);
-        } else {
-          showMessage('❌ Error: ' + (data.message || 'Upload gagal'), 'error');
-        }
-      } catch (error) {
-        showMessage('❌ Error: ' + error.message, 'error');
-      } finally {
-        loading.style.display = 'none';
-      }
-    });
-    
-    function showMessage(text, type) {
-      messageDiv.textContent = text;
-      messageDiv.className = 'message ' + type;
-      messageDiv.style.display = 'block';
-    }
-  </script>
-</body>
-</html>
-  `;
-  
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.send(html);
-};
-
-// DEVELOPMENT ONLY: POST /books/upload-dev - Upload book (no auth)
-exports.uploadBookDev = async (req, res) => {
+// GET /books/top-picks [public]: ambil daftar Pustakrew's Pick
+exports.getTopPicks = async (req, res) => {
   try {
-    const { title, description, year, pages, isbn } = req.body;
-    let { authors, genres } = req.body;
-    const file = req.files?.bookFile;
+    // auto-create tabel if not exists (safe to re-run)
+    await db.executeQuery(`
+      CREATE TABLE IF NOT EXISTS librarian_picks (
+        id          SERIAL PRIMARY KEY,
+        book_id     UUID NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        sort_order  INT  NOT NULL DEFAULT 0,
+        created_at  TIMESTAMPTZ DEFAULT now(),
+        updated_at  TIMESTAMPTZ DEFAULT now()
+      )
+    `, []);
 
-    // Validation
-    if (!title) {
-      return res.status(400).json({ success: false, message: 'Title is required' });
-    }
+    const result = await db.executeQuery(`
+      SELECT
+        b.id, b.title, b.authors, b.genres, b.cover_url,
+        b.avg_rating, b.rating_count, b.year, b.pages,
+        b.available, b.total_stock, b.description,
+        lp.sort_order
+      FROM librarian_picks lp
+      JOIN books b ON b.id = lp.book_id AND b.is_active = true
+      ORDER BY lp.sort_order ASC
+    `, []);
 
-    // Parse authors - accept string or array
-    if (typeof authors === 'string') {
-      authors = authors.split(',').map(a => a.trim()).filter(a => a);
-    }
-    if (!Array.isArray(authors) || authors.length === 0) {
-      return res.status(400).json({ success: false, message: 'Authors is required' });
-    }
-
-    // Parse genres - accept string or array
-    if (typeof genres === 'string') {
-      genres = genres.split(',').map(g => g.trim()).filter(g => g);
-    }
-    if (!Array.isArray(genres) || genres.length === 0) {
-      return res.status(400).json({ success: false, message: 'Genres is required' });
-    }
-
-    let fileUrl = null;
-    let fileType = 'application/pdf';
-
-    // Upload file to local storage
-    if (file) {
-      if (!['application/pdf', 'application/x-pdf'].includes(file.mimetype)) {
-        return res.status(400).json({ success: false, message: 'Only PDF files are allowed' });
-      }
-
-      fileType = file.mimetype;
-      const fileName = `${uuidv4()}-${Date.now()}.pdf`;
-      
-      try {
-        // Read file data (handle both temp file and in-memory data)
-        let fileBuffer;
-        if (file.tempFilePath) {
-          // If using temp files, read from disk
-          const fs = require('fs');
-          fileBuffer = fs.readFileSync(file.tempFilePath);
-          console.log(`📄 Read PDF from temp: ${file.tempFilePath} (${fileBuffer.length} bytes)`);
-        } else {
-          // Fallback to in-memory data
-          fileBuffer = file.data;
-          console.log(`📄 Using in-memory PDF data (${fileBuffer.length} bytes)`);
-        }
-
-        // Check file size
-        if (!fileBuffer || fileBuffer.length === 0) {
-          return res.status(400).json({ success: false, message: 'PDF file is empty (0 bytes)' });
-        }
-
-        // DEVELOPMENT: Upload to local storage
-        fileUrl = await storage.uploadFile(fileName, fileBuffer, fileType);
-      } catch (uploadError) {
-        console.error('Storage upload error:', uploadError.message);
-        return res.status(500).json({ success: false, message: 'Failed to upload file to storage' });
-      }
-    } else {
-      return res.status(400).json({ success: false, message: 'PDF file is required' });
-    }
-
-    // Fetch cover from OpenLibrary if ISBN provided
-    let coverId = null;
-    let openLibraryData = null;
-
-    if (isbn && isbn.trim().length > 0) {
-      const openLibraryService = require('../services/openLibraryService');
-      try {
-        console.log(`\n${'='.repeat(60)}`);
-        console.log(`📖 STARTING ISBN COVER LOOKUP`);
-        console.log(`ISBN provided: ${isbn}`);
-        console.log(`ISBN type: ${typeof isbn}`);
-        console.log(`ISBN length: ${isbn.length}`);
-        console.log(`${'='.repeat(60)}\n`);
-        
-        openLibraryData = await openLibraryService.fetchBookByISBN(isbn);
-        
-        if (openLibraryData) {
-          coverId = openLibraryData.cover_id;
-          console.log(`\n✅ SUCCESS - Cover ID retrieved: ${coverId}`);
-          console.log(`Book Title: ${openLibraryData.title}`);
-          console.log(`Authors: ${openLibraryData.authors.join(', ')}`);
-        } else {
-          console.warn(`\n⚠️  OpenLibrary returned null - no data found for ISBN: ${isbn}`);
-        }
-      } catch (error) {
-        console.error(`\n❌ Error fetching from OpenLibrary: ${error.message}`);
-        console.error(error);
-        // Continue anyway, cover is optional
-      }
-    } else {
-      console.log(`[Upload] No ISBN provided - skipping cover lookup`);
-    }
-
-    // Insert to database
-    const pool = require('../config/database').getPool();
-    const query = `
-      INSERT INTO books (title, authors, genres, description, year, pages, language, isbn, cover_id, file_url, file_type, is_active)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true)
-      RETURNING *
-    `;
-
-    const result = await pool.query(query, [
-      title,
-      JSON.stringify(authors),
-      JSON.stringify(genres),
-      description || null,
-      year ? parseInt(year) : null,
-      pages ? parseInt(pages) : null,
-      'id',
-      isbn && isbn.trim().length > 0 ? isbn.replace(/[-\s]/g, '') : null,
-      coverId,
-      fileUrl,
-      fileType
-    ]);
-
-    if (!result || !result.rows || result.rows.length === 0) {
-      return res.status(500).json({ success: false, message: 'Failed to save book to database' });
-    }
-
-    const bookData = result.rows[0];
-
-    res.status(201).json({
-      success: true,
-      message: '✅ Book uploaded successfully' + (coverId ? ' with cover!' : ''),
-      data: {
-        id: bookData.id,
-        title: bookData.title,
-        authors: bookData.authors,
-        genres: bookData.genres,
-        isbn: bookData.isbn,
-        cover_id: bookData.cover_id,
-        file_url: bookData.file_url,
-        file_type: bookData.file_type
-      }
-    });
+    const rows = toRows(result);
+    res.json({ success: true, data: rows });
   } catch (error) {
-    console.error('Error uploading book (dev):', error.message);
+    console.error('Error fetching top picks:', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// REVIEW ENDPOINTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// POST /reviews - Create or update a review
-exports.createOrUpdateReview = async (req, res) => {
+// PUT /admin/books/top-picks [admin]: update daftar Pustakrew's Pick
+// Body: { book_ids: ["uuid1", "uuid2", "uuid3"] }
+exports.setTopPicks = async (req, res) => {
   try {
-    const { book_id, rating, review_text } = req.body;
-    const firebase_uid = req.user?.uid; // From Firebase token
-    console.log('[DEBUG] Received review submission:', { book_id, firebase_uid, rating, review_text });
+    const { book_ids } = req.body;
 
-    // Validation
-    if (!book_id || !rating) {
-      return res.status(400).json({ success: false, message: 'book_id and rating are required' });
+    if (!Array.isArray(book_ids) || book_ids.length === 0) {
+      return res.status(400).json({ success: false, message: 'book_ids harus array dan tidak boleh kosong' });
+    }
+    if (book_ids.length > 3) {
+      return res.status(400).json({ success: false, message: 'Maksimal 3 buku untuk Pustakrew\'s Pick' });
     }
 
-    if (!firebase_uid) {
-      return res.status(401).json({ success: false, message: 'User authentication required' });
+    // Hapus semua picks lama, lalu insert yang baru
+    await db.executeQuery('DELETE FROM librarian_picks', []);
+
+    for (let i = 0; i < book_ids.length; i++) {
+      await db.executeQuery(
+        'INSERT INTO librarian_picks (book_id, sort_order) VALUES ($1, $2)',
+        [book_ids[i], i + 1]
+      );
     }
 
-    if (rating < 1 || rating > 5) {
-      return res.status(400).json({ success: false, message: 'Rating must be between 1 and 5' });
-    }
-
-    const pool = require('../config/database').getPool();
-
-    // Lookup user's UUID from firebase_uid
-    const userLookupQuery = 'SELECT id FROM users WHERE firebase_uid = $1';
-    const userResult = await pool.query(userLookupQuery, [firebase_uid]);
-    
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'User not found - please complete profile setup' });
-    }
-    
-    const user_id = userResult.rows[0].id; // This is the UUID
-    console.log('[DEBUG] User UUID resolved:', user_id);
-
-    // Check if review exists
-    const checkQuery = 'SELECT id FROM reviews WHERE user_id = $1 AND book_id = $2';
-    const checkResult = await pool.query(checkQuery, [user_id, book_id]);
-    console.log('[DEBUG] Existing review check:', checkResult.rows.length > 0 ? 'Found' : 'Not found');
-
-    let result;
-    if (checkResult.rows.length > 0) {
-      // Update existing review
-      const updateQuery = `
-        UPDATE reviews 
-        SET rating = $1, review_text = $2, updated_at = NOW()
-        WHERE user_id = $3 AND book_id = $4
-        RETURNING *
-      `;
-      result = await pool.query(updateQuery, [rating, review_text || null, user_id, book_id]);
-      console.log('[DEBUG] Review updated');
-    } else {
-      // Create new review
-      const insertQuery = `
-        INSERT INTO reviews (user_id, book_id, rating, review_text, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, NOW(), NOW())
-        RETURNING *
-      `;
-      result = await pool.query(insertQuery, [user_id, book_id, rating, review_text || null]);
-      console.log('[DEBUG] Review created');
-    }
-
-    const review = result.rows[0];
-
-    // Recalculate book's average rating and review count
-    const statsQuery = `
-      SELECT 
-        COUNT(*) as rating_count,
-        ROUND(AVG(rating)::numeric, 2) as avg_rating
-      FROM reviews
-      WHERE book_id = $1
-    `;
-    const statsResult = await pool.query(statsQuery, [book_id]);
-    const stats = statsResult.rows[0];
-    console.log('[DEBUG] Calculated stats:', stats);
-
-    // Update book's avg_rating and rating_count
-    const updateBookQuery = `
-      UPDATE books 
-      SET avg_rating = $1, rating_count = $2, updated_at = NOW()
-      WHERE id = $3
-      RETURNING avg_rating, rating_count, id
-    `;
-    const updateResult = await pool.query(updateBookQuery, [
-      parseFloat(stats.avg_rating) || 0,
-      parseInt(stats.rating_count) || 0,
-      book_id
-    ]);
-    const updatedStats = updateResult.rows[0];
-    console.log('[DEBUG] Book stats updated:', updatedStats);
-    console.log(`✅ Book ${book_id} updated: avg_rating=${stats.avg_rating}, rating_count=${stats.rating_count}`);
-
-    // Fetch fresh book data to return
-    const freshBookQuery = 'SELECT * FROM books WHERE id = $1';
-    const freshBookResult = await pool.query(freshBookQuery, [book_id]);
-    const freshBook = freshBookResult.rows[0];
-    console.log('[DEBUG] Fresh book data retrieved:', { avg_rating: freshBook.avg_rating, rating_count: freshBook.rating_count });
-
-    const responseData = {
-      success: true,
-      message: checkResult.rows.length > 0 ? 'Review updated' : 'Review created',
-      data: {
-        review: {
-          id: review.id,
-          user_id: review.user_id,
-          book_id: review.book_id,
-          rating: review.rating,
-          review_text: review.review_text,
-          created_at: review.created_at,
-          updated_at: review.updated_at,
-        },
-        book_stats: {
-          avg_rating: parseFloat(freshBook.avg_rating) || 0,
-          rating_count: parseInt(freshBook.rating_count) || 0
-        },
-        updated_book: freshBook
-      }
-    };
-    
-    console.log('[DEBUG] ✅ FINAL RESPONSE TO CLIENT:', JSON.stringify({
-      book_id,
-      book_stats: responseData.data.book_stats,
-      updated_book_ratings: {
-        avg_rating: freshBook.avg_rating,
-        rating_count: freshBook.rating_count
-      }
-    }, null, 2));
-
-    res.status(201).json(responseData);
-  } catch (error) {
-    console.error('Error creating/updating review:', error.message);
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-exports.updateReview = exports.createOrUpdateReview;
-
-exports.deleteReview = async (req, res) => {
-  return res.status(501).json({ success: false, message: 'Review delete is not implemented yet' });
-};
-
-// GET /books/:bookId/reviews - Get all reviews for a book
-exports.getBookReviews = async (req, res) => {
-  try {
-    const { id: bookId } = req.params;  // Route param is :id, not :bookId
-    const { limit = 50, offset = 0 } = req.query;
-
-    const pool = require('../config/database').getPool();
-
-    // Get reviews with user info
-    const query = `
-      SELECT 
-        r.id,
-        r.user_id,
-        r.book_id,
-        r.rating,
-        r.review_text,
-        r.created_at,
-        r.updated_at,
-        u.username as name,
-        SUBSTRING(u.username, 1, 1) as avatar
-      FROM reviews r
-      LEFT JOIN users u ON r.user_id = u.id
-      WHERE r.book_id = $1
-      ORDER BY r.created_at DESC
-      LIMIT $2 OFFSET $3
-    `;
-
-    const result = await pool.query(query, [bookId, limit, offset]);
-
-    // Get total count
-    const countQuery = 'SELECT COUNT(*) as total FROM reviews WHERE book_id = $1';
-    const countResult = await pool.query(countQuery, [bookId]);
-
-    const reviews = result.rows.map(r => ({
-      id: r.id,
-      user_id: r.user_id,
-      name: r.name || 'Anonymous',
-      avatar: r.avatar || 'U',
-      rating: r.rating,
-      text: r.review_text,
-      time: r.created_at ? new Date(r.created_at).toLocaleDateString('id-ID') : '-',
-      likes: 0 // Placeholder for future implementation
-    }));
+    // Return picks terbaru
+    const result = await db.executeQuery(`
+      SELECT
+        b.id, b.title, b.authors, b.genres, b.cover_url,
+        b.avg_rating, b.year, lp.sort_order
+      FROM librarian_picks lp
+      JOIN books b ON b.id = lp.book_id AND b.is_active = true
+      ORDER BY lp.sort_order ASC
+    `, []);
 
     res.json({
       success: true,
-      data: reviews,
-      pagination: {
-        total: parseInt(countResult.rows[0].total),
-        limit: parseInt(limit),
-        offset: parseInt(offset)
-      }
+      message: 'Pustakrew\'s Pick berhasil diperbarui',
+      data: toRows(result),
     });
   } catch (error) {
-    console.error('Error fetching reviews:', error.message);
+    console.error('Error setting top picks:', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 };
-

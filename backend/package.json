@@ -16,7 +16,7 @@
     "dedupe:books:near:apply": "node scripts/dedupe_books.js --near --apply",
     "backfill:user-identity": "node scripts/backfill-user-public-identity.js --dry-run",
     "backfill:user-identity:apply": "node scripts/backfill-user-public-identity.js --apply",
-    "prepare": "node -e \"console.log('Skipping husky install in backend workspace.');\""
+    "prepare": "husky install"
   },
   "keywords": [],
   "author": "",
