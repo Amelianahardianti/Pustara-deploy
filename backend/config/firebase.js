@@ -1,21 +1,17 @@
-/**
- * Firebase Admin SDK Initialization
- * Centralized Firebase configuration
- */
-
 const admin = require("firebase-admin");
 
-// Load service account credentials
-const serviceAccount = require("../pustara-kw-firebase-adminsdk-fbsvc-e6e1ebe356.json");
-
-// Initialize Firebase Admin SDK
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
+const serviceAccount = {
   projectId: process.env.FIREBASE_PROJECT_ID,
-});
+  clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+  privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+};
 
-console.log("🔐 Firebase Admin SDK initialized");
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
 
-// Export Firebase admin instance
+  console.log("🔥 Firebase Admin SDK initialized successfully");
+}
+
 module.exports = admin;
-   

@@ -27,10 +27,11 @@ function isLocalHostname(hostname) {
 function shouldBypassCaptchaForLocalTesting(req) {
   const bypassEnabled = process.env.TURNSTILE_BYPASS_LOCAL === "true";
   const vercelEnv = process.env.VERCEL_ENV;
+  const nodeEnv = String(process.env.NODE_ENV || '').toLowerCase();
 
   // Never bypass on Vercel production.
   if (!bypassEnabled || vercelEnv === "production") {
-    return false;
+    // Continue with local-origin detection below.
   }
 
   const origin = getHeaderValue(req.headers.origin);
@@ -40,7 +41,9 @@ function shouldBypassCaptchaForLocalTesting(req) {
 
   try {
     const url = new URL(candidate);
-    return isLocalHostname(url.hostname);
+    const isLocal = isLocalHostname(url.hostname);
+    if (isLocal && nodeEnv !== 'production') return true;
+    return bypassEnabled && isLocal;
   } catch {
     return false;
   }
@@ -156,17 +159,14 @@ function getClientIp(req) {
 function createCaptchaMiddleware() {
   return async (req, res, next) => {
     if (shouldBypassCaptchaForLocalTesting(req)) {
-      console.log(`[CAPTCHA] ⏭️ Bypassed for local testing`);
       return next();
     }
 
     const token = req.body?.captchaToken;
     const remoteIp = getClientIp(req);
-    console.log(`[CAPTCHA] Verifying token:`, { hasToken: !!token, ip: remoteIp });
     const result = await verifyTurnstileToken(token, remoteIp);
 
     if (!result.success) {
-      console.log(`[CAPTCHA] ❌ Verification failed:`, result.error);
       return res.status(400).json({
         success: false,
         error: result.error || CONFIG.ERRORS.CAPTCHA_FAILED,
@@ -174,7 +174,6 @@ function createCaptchaMiddleware() {
       });
     }
 
-    console.log(`[CAPTCHA] ✅ Verification succeeded`);
     return next();
   };
 }

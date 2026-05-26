@@ -1,8 +1,11 @@
 const cron   = require('node-cron');
-const axios  = require('axios');
+const crypto = require('crypto');
 const { Redis } = require('@upstash/redis'); 
 // Import isNeon to make queries compatible with both Neon and Azure
 const { executeQuery, isNeon } = require('../config/database');   
+const { insertNotification, getAllNotifiableUsers } = require('../services/notificationService');
+const { sendEmail } = require('../services/emailService');
+const { expireStaleQueueReservations } = require('../controllers/shelfController');
 
 const FASTAPI_URL = process.env.FASTAPI_URL;
 const HF_TOKEN    = process.env.HF_TOKEN;
@@ -21,9 +24,375 @@ const redis = new Redis({
 });
 
 const STREAM_CURSOR_KEY = 'sync:activity_stream:last_id';
+const DIGEST_SNAPSHOT_KEY = 'mail:digest:last_hash';
+const DIGEST_SENT_AT_KEY = 'mail:digest:last_sent_at';
 
 const USER_ID_CACHE = new Map();
 const BOOK_ID_CACHE = new Map();
+
+function toRows(result) {
+  if (Array.isArray(result)) return result;
+  if (result && Array.isArray(result.rows)) return result.rows;
+  if (result && Array.isArray(result.recordset)) return result.recordset;
+  return [];
+}
+
+function stableHash(payload) {
+  return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+}
+
+async function safeRedisGet(key) {
+  try {
+    return await redis.get(key);
+  } catch {
+    return null;
+  }
+}
+
+async function safeRedisSet(key, value) {
+  try {
+    await redis.set(key, value);
+  } catch (_) {
+    // noop
+  }
+}
+
+async function fetchLatestBooks(limit = 6) {
+  const neonSql = `
+    SELECT id::text AS id, title, created_at
+    FROM books
+    WHERE is_active = true
+    ORDER BY created_at DESC
+    LIMIT $1
+  `;
+  const azureSql = `
+    SELECT TOP 6 CAST(id AS NVARCHAR(255)) AS id, title, created_at
+    FROM books
+    WHERE is_active = 1
+    ORDER BY created_at DESC
+  `;
+
+  const rows = isNeon
+    ? toRows(await executeQuery(neonSql, [limit]))
+    : toRows(await executeQuery(azureSql, []));
+
+  return rows.map((row) => ({ id: String(row.id || ''), title: String(row.title || ''), created_at: row.created_at || null }));
+}
+
+async function fetchCurrentTrending(limit = 6) {
+  try {
+    const res = await fetch(`${FASTAPI_URL}/recommendations/trending?top_n=${limit}`, {
+      headers: { Authorization: `Bearer ${HF_TOKEN}` },
+      signal: AbortSignal.timeout(15000), // Pengganti timeout axios
+    });
+    
+    if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+    const data = await res.json();
+    
+    const list = Array.isArray(data?.trending)
+      ? data.trending
+      : Array.isArray(data?.recommendations)
+        ? data.recommendations
+        : [];
+
+    return list.slice(0, limit).map((item) => ({
+      book_id: String(item.book_id || item.id || ''),
+      title: String(item.title || ''),
+      score: Number(item.trending_score || 0),
+    }));
+  } catch (error) {
+    log('DIGEST', `Trending fetch warning: ${error.message}`);
+    return [];
+  }
+}
+
+async function sendCommunityDigestIfNeeded() {
+  log('DIGEST', 'Checking for new digest-worthy updates...');
+
+  try {
+    const [latestBooks, trending, users, lastAiRebuildAt] = await Promise.all([
+      fetchLatestBooks(6),
+      fetchCurrentTrending(6),
+      getAllNotifiableUsers(),
+      safeRedisGet('ai:last_rebuild_at'),
+    ]);
+
+    const digestPayload = {
+      newestBookIds: latestBooks.map((book) => book.id),
+      trendingIds: trending.map((book) => book.book_id),
+      lastAiRebuildAt: String(lastAiRebuildAt || ''),
+    };
+    const digestHash = stableHash(digestPayload);
+    const previousHash = await safeRedisGet(DIGEST_SNAPSHOT_KEY);
+
+    if (previousHash && previousHash === digestHash) {
+      log('DIGEST', 'No new changes detected. Skipping digest send.');
+      return;
+    }
+
+    if (users.length === 0) {
+      log('DIGEST', 'No users with deliverable emails.');
+      await safeRedisSet(DIGEST_SNAPSHOT_KEY, digestHash);
+      return;
+    }
+
+    const newBooksText = latestBooks.length > 0
+      ? latestBooks.map((book, idx) => `${idx + 1}. ${book.title}`).join('\n')
+      : 'Belum ada data buku baru.';
+
+    const trendingText = trending.length > 0
+      ? trending.map((book, idx) => `${idx + 1}. ${book.title}`).join('\n')
+      : 'Belum ada data trending saat ini.';
+
+    const aiLine = lastAiRebuildAt
+      ? `PustarAI terakhir sinkron katalog pada: ${lastAiRebuildAt}`
+      : 'Status sinkronisasi PustarAI belum tersedia.';
+
+    await Promise.all(users.map(async (user) => {
+      await insertNotification({
+        userId: user.id,
+        type: 'system',
+        title: 'Update Terbaru Pustara',
+        body: 'Ada update baru: katalog terbaru, trending terkini, dan pembaruan PustarAI.',
+      });
+
+      await sendEmail({
+        to: user.email,
+        subject: 'Pustara - Update Baru (Trending + Katalog + PustarAI)',
+        text: [
+          `Halo ${user.name || 'Pustara Reader'},`,
+          '',
+          'Ada update baru di Pustara:',
+          '',
+          'Buku terbaru:',
+          newBooksText,
+          '',
+          'Sedang trending:',
+          trendingText,
+          '',
+          aiLine,
+          '',
+          'Yuk buka Pustara untuk cek update lengkapnya.',
+        ].join('\n'),
+      }).catch((err) => {
+        log('DIGEST', `Email warning for ${user.email}: ${err.message}`);
+      });
+    }));
+
+    await safeRedisSet(DIGEST_SNAPSHOT_KEY, digestHash);
+    await safeRedisSet(DIGEST_SENT_AT_KEY, new Date().toISOString());
+    log('DIGEST', `Digest sent to ${users.length} users.`);
+  } catch (error) {
+    log('DIGEST', `❌ Error: ${error.message}`);
+  }
+}
+
+async function sendLoanDeadlineReminders() {
+  log('LOANS', 'Checking due-date reminders and overdue loans...');
+  try {
+    const now = new Date();
+    const rows = isNeon
+      ? toRows(await executeQuery(`
+          SELECT l.id::text AS loan_id,
+                 l.user_id::text AS user_id,
+                 l.book_id::text AS book_id,
+                 COALESCE(l.due_date, l.due_at) AS due_at,
+                 l.status,
+                 u.email,
+                 COALESCE(u.display_name, u.username, 'Pustara Reader') AS user_name,
+                 b.title AS book_title
+          FROM loans l
+          JOIN users u ON u.id = l.user_id
+          JOIN books b ON b.id = l.book_id
+          WHERE l.returned_at IS NULL
+            AND l.status IN ('active', 'extended', 'overdue')
+        `))
+      : toRows(await executeQuery(`
+          SELECT CAST(l.id AS NVARCHAR(255)) AS loan_id,
+                 CAST(l.user_id AS NVARCHAR(255)) AS user_id,
+                 CAST(l.book_id AS NVARCHAR(255)) AS book_id,
+                 COALESCE(l.due_date, l.due_at) AS due_at,
+                 l.status,
+                 u.email,
+                 COALESCE(u.display_name, u.username, 'Pustara Reader') AS user_name,
+                 b.title AS book_title
+          FROM loans l
+          JOIN users u ON u.id = l.user_id
+          JOIN books b ON b.id = l.book_id
+          WHERE l.returned_at IS NULL
+            AND l.status IN ('active', 'extended', 'overdue')
+        `));
+
+    for (const loan of rows) {
+      const dueAt = loan.due_at ? new Date(loan.due_at) : null;
+      if (!dueAt || Number.isNaN(dueAt.getTime())) continue;
+
+      const hoursLeft = (dueAt.getTime() - now.getTime()) / (1000 * 60 * 60);
+      let stage = null;
+      if (hoursLeft < 0) stage = 'overdue';
+      else if (hoursLeft <= 24) stage = 'due_1d';
+      else if (hoursLeft <= 72) stage = 'due_3d';
+
+      if (!stage) continue;
+
+      const dedupeKey = `mail:loan:${loan.loan_id}:${stage}`;
+      const alreadySent = await safeRedisGet(dedupeKey);
+      if (alreadySent) continue;
+
+      if (stage === 'overdue' && String(loan.status || '').toLowerCase() !== 'overdue') {
+        try {
+          await executeQuery(
+            isNeon
+              ? `UPDATE loans SET status = 'overdue' WHERE id::text = $1`
+              : `UPDATE loans SET status = 'overdue' WHERE CAST(id AS NVARCHAR(255)) = $1`,
+            [String(loan.loan_id)]
+          );
+        } catch (_) {
+          // keep processing reminder even if status update fails
+        }
+      }
+
+      const stageTitle = stage === 'overdue'
+        ? 'Peminjaman Terlambat'
+        : stage === 'due_1d'
+          ? 'Pengingat: Jatuh Tempo Besok'
+          : 'Pengingat: 3 Hari Lagi';
+
+      const stageBody = stage === 'overdue'
+        ? `Buku \"${loan.book_title}\" sudah melewati tenggat. Mohon segera dikembalikan.`
+        : stage === 'due_1d'
+          ? `Buku \"${loan.book_title}\" akan jatuh tempo dalam 1 hari. Jangan lupa dikembalikan.`
+          : `Buku \"${loan.book_title}\" akan jatuh tempo dalam 3 hari.`;
+
+      await insertNotification({
+        userId: String(loan.user_id),
+        type: 'due',
+        title: stageTitle,
+        body: stageBody,
+        bookId: String(loan.book_id),
+      });
+
+      await sendEmail({
+        to: String(loan.email || ''),
+        subject: `Pustara - ${stageTitle}`,
+        text: [
+          `Halo ${loan.user_name || 'Pustara Reader'},`,
+          '',
+          stageBody,
+          '',
+          `Tenggat: ${dueAt.toLocaleString('id-ID')}`,
+          'Silakan buka Pustara untuk detail pinjaman.',
+        ].join('\n'),
+      }).catch((error) => {
+        log('LOANS', `Email warning for ${loan.email}: ${error.message}`);
+      });
+
+      await safeRedisSet(dedupeKey, new Date().toISOString());
+    }
+
+    log('LOANS', `Processed ${rows.length} active loans.`);
+  } catch (error) {
+    log('LOANS', `❌ Error: ${error.message}`);
+  }
+}
+
+async function autoReturnExpiredLoans() {
+  log('LOANS', 'Auto-returning expired loans...');
+  try {
+    const expiredLoans = isNeon
+      ? toRows(await executeQuery(`
+          UPDATE loans l
+          SET returned_at = CURRENT_TIMESTAMP,
+              status = 'returned'
+          FROM books b
+          WHERE b.id = l.book_id
+            AND l.returned_at IS NULL
+            AND l.status IN ('active', 'extended', 'overdue')
+            AND COALESCE(l.due_date, l.due_at) <= CURRENT_TIMESTAMP
+          RETURNING l.id::text AS loan_id,
+                    l.user_id::text AS user_id,
+                    l.book_id::text AS book_id,
+                    COALESCE(l.due_date, l.due_at) AS due_at,
+                    b.title AS book_title
+        `))
+      : toRows(await executeQuery(`
+          UPDATE l
+          SET returned_at = GETDATE(),
+              status = 'returned'
+          OUTPUT CAST(inserted.id AS NVARCHAR(255)) AS loan_id,
+                 CAST(inserted.user_id AS NVARCHAR(255)) AS user_id,
+                 CAST(inserted.book_id AS NVARCHAR(255)) AS book_id,
+                 COALESCE(inserted.due_date, inserted.due_at) AS due_at,
+                 b.title AS book_title
+          FROM loans l
+          JOIN books b ON b.id = l.book_id
+          WHERE l.returned_at IS NULL
+            AND l.status IN ('active', 'extended', 'overdue')
+            AND COALESCE(l.due_date, l.due_at) <= GETDATE()
+        `));
+
+    if (expiredLoans.length === 0) {
+      log('LOANS', 'No expired loans to auto-return.');
+      return;
+    }
+
+    for (const loan of expiredLoans) {
+      try {
+        await executeQuery(
+          isNeon
+            ? `UPDATE books
+               SET available = LEAST(COALESCE(available, 0) + 1, COALESCE(total_stock, available + 1))
+               WHERE id::text = $1`
+            : `UPDATE books
+               SET available = CASE
+                 WHEN COALESCE(available, 0) + 1 > COALESCE(total_stock, available + 1)
+                 THEN COALESCE(total_stock, available + 1)
+                 ELSE COALESCE(available, 0) + 1
+               END
+               WHERE CAST(id AS NVARCHAR(255)) = $1`,
+          [String(loan.book_id)]
+        );
+
+        await executeQuery(
+          isNeon
+            ? `UPDATE reading_sessions
+               SET status = 'paused',
+                   last_read_at = CURRENT_TIMESTAMP
+               WHERE user_id::text = $1
+                 AND book_id::text = $2
+                 AND status IN ('reading', 'active')`
+            : `UPDATE reading_sessions
+               SET status = 'paused',
+                   last_read_at = GETDATE()
+               WHERE CAST(user_id AS NVARCHAR(255)) = $1
+                 AND CAST(book_id AS NVARCHAR(255)) = $2
+                 AND status IN ('reading', 'active')`,
+          [String(loan.user_id), String(loan.book_id)]
+        );
+
+        await insertNotification({
+          userId: String(loan.user_id),
+          type: 'due',
+          title: 'Akses Baca Berakhir',
+          body: `Masa pinjam buku "${loan.book_title || 'Buku'}" sudah selesai, jadi akses bacanya otomatis ditutup. Kamu bisa meminjam ulang kalau ingin lanjut membaca.`,
+          bookId: String(loan.book_id),
+          data: {
+            book_id: String(loan.book_id),
+            loan_id: String(loan.loan_id),
+            due_at: loan.due_at || null,
+            action: 'reborrow',
+          },
+        });
+      } catch (loanError) {
+        log('LOANS', `Auto-return post-processing warning for ${loan.loan_id}: ${loanError.message}`);
+      }
+    }
+
+    log('LOANS', `Auto-returned ${expiredLoans.length} expired loans.`);
+  } catch (error) {
+    log('LOANS', `Auto-return error: ${error.message}`);
+  }
+}
 
 function makeSyntheticIdentity(firebaseUid) {
   const raw = String(firebaseUid || '').trim();
@@ -217,21 +586,40 @@ cron.schedule('0 3 * * *', async () => {
   log('REBUILD', 'Starting AI model rebuild process...');
   try {
     const reindexSecret = CRON_SECRET || 'PUSTARAbrakadaba23';
-    const res = await axios.post(
-      `${FASTAPI_URL}/reindex`,
-      { secret: reindexSecret },
-      {
-        timeout: 300000,
-        headers: {
-          Authorization: `Bearer ${HF_TOKEN}`,
-          'Content-Type': 'application/json',
-        }, // Access to Private Space
-      }
-    );
-    log('REBUILD', `✅ Success: ${JSON.stringify(res.data)}`);
+    const res = await fetch(`${FASTAPI_URL}/reindex`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${HF_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ secret: reindexSecret }),
+      signal: AbortSignal.timeout(300000)
+    });
+    
+    if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+    const data = await res.json();
+    
+    await safeRedisSet('ai:last_rebuild_at', new Date().toISOString());
+    await safeRedisSet('ai:last_rebuild_payload', JSON.stringify(data || {}));
+    log('REBUILD', `✅ Success: ${JSON.stringify(data)}`);
   } catch (err) {
     log('REBUILD', `❌ Error: ${err.message}`);
   }
+}, { timezone: 'Asia/Jakarta' });
+
+// ─────────────────────────────────────────────────────────────
+// Job 5: Due-date reminders + overdue status sync — every hour
+// ─────────────────────────────────────────────────────────────
+cron.schedule('15 * * * *', async () => {
+  await autoReturnExpiredLoans();
+  await sendLoanDeadlineReminders();
+}, { timezone: 'Asia/Jakarta' });
+
+// ─────────────────────────────────────────────────────────────
+// Job 6: Community digest for new books/trending/AI updates — every 6 hours
+// ─────────────────────────────────────────────────────────────
+cron.schedule('30 */6 * * *', async () => {
+  await sendCommunityDigestIfNeeded();
 }, { timezone: 'Asia/Jakarta' });
 
 // ─────────────────────────────────────────────────────────────
@@ -240,10 +628,11 @@ cron.schedule('0 3 * * *', async () => {
 cron.schedule('0 */6 * * *', async () => {
   log('TRENDING', 'Refreshing trending books...');
   try {
-    const res = await axios.get(`${FASTAPI_URL}/recommendations/trending?top_n=50`, {
+    const res = await fetch(`${FASTAPI_URL}/recommendations/trending?top_n=50`, {
       headers: { 'Authorization': `Bearer ${HF_TOKEN}` }
     });
-    log('TRENDING', `✅ ${res.data.recommendations?.length || 0} trending books updated`);
+    const data = await res.json();
+    log('TRENDING', `✅ ${data.recommendations?.length || 0} trending books updated`);
   } catch (err) {
     log('TRENDING', `❌ Error: ${err.message}`);
   }
@@ -378,5 +767,15 @@ cron.schedule('0 * * * *', async () => {
 */
 
 log('INIT', '🚀 All Pustara Cron Job systems are active!');
+
+cron.schedule('*/30 * * * *', async () => {
+  log('QUEUE', 'Reconciling queue reservations...');
+  try {
+    const result = await expireStaleQueueReservations();
+    log('QUEUE', `Queue reservation reconciliation processed ${result.processed || 0} books.`);
+  } catch (err) {
+    log('QUEUE', `Queue reservation reconciliation failed: ${err.message}`);
+  }
+}, { timezone: 'Asia/Jakarta' });
 
 module.exports = {};

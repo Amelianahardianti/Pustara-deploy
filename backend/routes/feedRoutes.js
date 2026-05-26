@@ -7,6 +7,8 @@ const express = require('express');
 const {
   getMyFeedActivity,
   getMyNotifications,
+  markMyNotificationsRead,
+  deleteMyNotification,
   getMyRecommendations,
 } = require('../controllers/feedController');
 
@@ -25,6 +27,9 @@ router.get('/me/activity', getMyFeedActivity);
  * Requires authentication
  */
 router.get('/me/notifications', getMyNotifications);
+router.patch('/me/notifications/read', markMyNotificationsRead);
+router.patch('/me/notifications/:notificationId/read', markMyNotificationsRead);
+router.delete('/me/notifications/:notificationId', deleteMyNotification);
 
 /**
  * GET /feed/me/recommendations

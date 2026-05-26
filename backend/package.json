@@ -6,6 +6,9 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
+    "test": "jest --coverage --testEnvironment=node",
+    "test:watch": "jest --watch --testEnvironment=node",
+    "test:verbose": "jest --verbose --testEnvironment=node",
     "backup:db": "node scripts/backup_db.js",
     "dedupe:books": "node scripts/dedupe_books.js",
     "dedupe:books:apply": "node scripts/dedupe_books.js --apply",
@@ -21,8 +24,8 @@
   "type": "commonjs",
   "dependencies": {
     "@azure/storage-blob": "^12.31.0",
+    "@supabase/supabase-js": "^2.105.4",
     "@upstash/redis": "^1.37.0",
-    "axios": "^1.13.6",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
@@ -32,10 +35,15 @@
     "node-cron": "^4.2.1",
     "nodemailer": "^6.10.1",
     "pg": "^8.20.0",
-    "redis": "^5.11.0"
+    "redis": "^5.11.0",
+    "ua-parser-js": "^2.0.10"
   },
   "devDependencies": {
+    "@types/canvas-confetti": "^1.9.0",
+    "@types/jest": "^29.5.11",
     "husky": "^8.0.3",
-    "nodemon": "^3.1.14"
+    "jest": "^29.7.0",
+    "nodemon": "^3.1.14",
+    "supertest": "^6.3.3"
   }
 }

@@ -1,5 +1,5 @@
 const cron   = require('node-cron');
-const axios  = require('axios');
+// const axios  = require('axios');
 const { executeQuery, isNeon } = require('../config/database');   
 
 const FASTAPI_URL  = process.env.FASTAPI_URL  || 'http://localhost:8001';
@@ -18,18 +18,20 @@ async function rebuildModels() {
   log('info', '🔄 Triggering model rebuild …');
   try {
     const reindexSecret = process.env.RI_SECRET || CRON_SECRET || 'PUSTARAbrakadaba23';
-    const res = await axios.post(
-      `${FASTAPI_URL}/reindex`,
-      { secret: reindexSecret },
-      {
-        timeout: 5 * 60 * 1000,
-        headers: {
-          Authorization: `Bearer ${process.env.HF_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-      }
-    );
-    const { catalog_size, model_b, timestamp } = res.data;
+    const res = await fetch(`${FASTAPI_URL}/reindex`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.HF_TOKEN}`,
+      },
+      body: JSON.stringify({ secret: reindexSecret }),
+      signal: AbortSignal.timeout(5 * 60 * 1000), // Pengganti timeout axios
+    });
+
+    if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+    const data = await res.json();
+
+    const { catalog_size, model_b, timestamp } = data;
     log('info', '✅ Rebuild done. Catalog: %d, Model B: %s, at %s', catalog_size, model_b, timestamp);
   } catch (err) {
     log('error', '❌ Rebuild failed:', err.message);

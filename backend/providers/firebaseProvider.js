@@ -146,20 +146,9 @@ class FirebaseProvider {
       const data = await response.json();
 
       if (!data.idToken) {
-        // Map Firebase error codes to user-friendly messages
-        let friendlyError = "Sign in failed";
-        if (data.error?.message) {
-          const errorMsg = data.error.message.toUpperCase();
-          if (errorMsg.includes('EMAIL_NOT_FOUND')) friendlyError = "Email tidak terdaftar";
-          else if (errorMsg.includes('INVALID_PASSWORD')) friendlyError = "Password salah";
-          else if (errorMsg.includes('USER_DISABLED')) friendlyError = "Akun dinonaktifkan";
-          else if (errorMsg.includes('TOO_MANY_ATTEMPTS')) friendlyError = "Terlalu banyak percobaan login. Coba lagi nanti";
-          else friendlyError = data.error.message;
-        }
-        console.log(`[FIREBASE] Error:`, { original: data.error?.message, friendly: friendlyError });
         return {
           success: false,
-          error: friendlyError,
+          error: data.error?.message || "Sign in failed",
         };
       }
 

@@ -16,32 +16,22 @@ class UserService {
    */
   static async createUser(uid, email, displayName = null) {
     try {
-      console.log(`📝 Creating user: uid=${uid}, email=${email}, displayName=${displayName}`);
-
-      if (!uid || !email) {
-        throw new Error(`Invalid user data: uid=${uid}, email=${email}`);
-      }
+      console.log(`📝 Creating user: uid=${uid}, email=${email}`);
 
       let rows;
       if (isNeon) {
         // Neon: users punya kolom firebase_uid, username, display_name
         const username = email.split('@')[0].toLowerCase().replace(/[^a-z0-9_]/g, '_');
-        console.log(`  Inserting to Neon: firebase_uid=${uid}, username=${username}, email=${email}, display_name=${displayName || username}`);
-        
-        const result = await executeQuery(`
+        rows = await executeQuery(`
           INSERT INTO users (firebase_uid, username, display_name, email)
           VALUES ($1, $2, $3, $4)
           ON CONFLICT (firebase_uid) DO UPDATE SET updated_at = NOW()
           RETURNING *
         `, [uid, username, displayName || username, email]);
-        
-        // Extract rows dari result (executeQuery return { rows: [...] })
-        rows = Array.isArray(result) ? result : (result?.rows || []);
-        console.log(`  Insert result: ${rows.length} rows returned`);
       } else {
         // Azure SQL
         const username = email.split('@')[0].toLowerCase().replace(/[^a-z0-9_]/g, '_');
-        const result = await executeQuery(`
+        rows = await executeQuery(`
           IF NOT EXISTS (SELECT 1 FROM users WHERE firebase_uid = @p1)
           BEGIN
             INSERT INTO users (firebase_uid, username, email, display_name)
@@ -49,19 +39,12 @@ class UserService {
           END
           SELECT * FROM users WHERE firebase_uid = @p1;
         `, [uid, username, email, displayName || username]);
-        
-        rows = Array.isArray(result) ? result : (result?.recordset || []);
       }
 
-      if (!rows || rows.length === 0) {
-        throw new Error(`No rows returned after insert/upsert for uid=${uid}`);
-      }
-
-      console.log(`✅ User created successfully: id=${rows[0].id}, uid=${uid}`);
+      console.log(`✅ User created: ${uid}`);
       return { success: true, data: rows[0] };
     } catch (error) {
-      console.error(`❌ createUser error for uid=${uid}:`, error.message);
-      console.error(`  Stack: ${error.stack}`);
+      console.error(`❌ createUser error:`, error.message);
       return { success: false, error: error.message };
     }
   }
@@ -71,11 +54,9 @@ class UserService {
    */
   static async getUserByUid(uid) {
     try {
-      const col  = isNeon ? 'firebase_uid' : 'uid';
-      const result = await executeQuery(`SELECT * FROM ${isNeon ? 'users' : 'Users'} WHERE ${col} = $1`, [uid]);
-      
-      // Extract rows dari result
-      const rows = Array.isArray(result) ? result : (result?.rows || result?.recordset || []);
+      // Use `firebase_uid` column for both Neon and Azure schema to avoid mismatches
+      const col  = 'firebase_uid';
+      const rows = await executeQuery(`SELECT * FROM ${isNeon ? 'users' : 'Users'} WHERE ${col} = $1`, [uid]);
       return { success: true, data: rows[0] || null };
     } catch (error) {
       console.error('getUserByUid error:', error.message);
@@ -98,8 +79,8 @@ class UserService {
   static async updateUser(uid, updates) {
     try {
       const allowed = isNeon
-        ? ['display_name', 'username', 'avatar_url', 'bio', 'preferred_genres']
-        : ['display_name', 'username', 'avatar_url', 'bio', 'preferred_genres'];
+        ? ['display_name', 'username', 'avatar_url', 'bio', 'preferred_genres', 'activity_visible', 'public_reading_list', 'public_reviews']
+        : ['display_name', 'username', 'avatar_url', 'bio', 'preferred_genres', 'activity_visible', 'public_reading_list', 'public_reviews'];
 
       const fields = Object.keys(updates).filter(k => allowed.includes(k));
       if (!fields.length) return { success: false, error: 'No valid fields to update' };
@@ -130,9 +111,176 @@ class UserService {
     }
   }
 
+  /**
+   * Get user role by Firebase UID
+   */
+  static async getUserRole(uid) {
+    try {
+      const col = 'firebase_uid';
+      const rows = await executeQuery(`SELECT role FROM ${isNeon ? 'users' : 'Users'} WHERE ${col} = $1`, [uid]);
+      return { success: true, role: rows[0]?.role || 'reader' };
+    } catch (error) {
+      console.error('getUserRole error:', error.message);
+      return { success: false, role: 'reader', error: error.message };
+    }
+  }
+
+  /**
+   * Update user role (admin only)
+   */
+  static async updateUserRole(uid, role) {
+    try {
+      if (!['reader', 'admin'].includes(role)) {
+        return { success: false, error: 'Invalid role' };
+      }
+
+      const col = isNeon ? 'firebase_uid' : 'uid';
+      const rows = await executeQuery(
+        isNeon
+          ? `UPDATE users SET role = $1, updated_at = NOW() WHERE ${col} = $2 RETURNING *`
+          : `UPDATE Users SET role = $1, updated_at = GETDATE() WHERE ${col} = $2; SELECT * FROM Users WHERE ${col} = $2;`,
+        [role, uid]
+      );
+
+      return { success: true, data: rows[rows.length - 1] || rows[0] || null };
+    } catch (error) {
+      console.error('updateUserRole error:', error.message);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Update user status (admin only)
+   */
+  static async updateUserStatus(uid, status) {
+    try {
+      if (!['active', 'suspended'].includes(status)) {
+        return { success: false, error: 'Invalid status' };
+      }
+
+      const col = isNeon ? 'firebase_uid' : 'uid';
+      const rows = await executeQuery(
+        isNeon
+          ? `UPDATE users SET status = $1, updated_at = NOW() WHERE ${col} = $2 RETURNING *`
+          : `UPDATE Users SET status = $1, updated_at = GETDATE() WHERE ${col} = $2; SELECT * FROM Users WHERE ${col} = $2;`,
+        [status, uid]
+      );
+
+      return { success: true, data: rows[rows.length - 1] || rows[0] || null };
+    } catch (error) {
+      console.error('updateUserStatus error:', error.message);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Delete user from database by Firebase UID
+   */
+  static async deleteUserByUid(uid) {
+    try {
+      const user = await this.getUserByUid(uid);
+      if (!user.success || !user.data) {
+        return { success: false, error: 'User not found' };
+      }
+
+      const userId = user.data.id;
+      const firebaseUid = user.data.firebase_uid || uid;
+      const userIdText = String(userId);
+
+      const cleanupQueries = [
+        ['DELETE FROM active_sessions WHERE firebase_uid = $1', [firebaseUid]],
+        ['DELETE FROM login_events WHERE firebase_uid = $1', [firebaseUid]],
+        ['DELETE FROM review_likes WHERE user_id = $1 OR review_id IN (SELECT id FROM reviews WHERE user_id = $1)', [userIdText]],
+        ['DELETE FROM follows WHERE follower_id = $1 OR following_id = $1', [userIdText]],
+        ['DELETE FROM notifications WHERE user_id = $1 OR actor_id = $1', [userIdText]],
+        ['DELETE FROM queue WHERE user_id = $1', [userIdText]],
+        ['DELETE FROM wishlist WHERE user_id = $1', [userIdText]],
+        ['DELETE FROM reading_sessions WHERE user_id = $1', [userIdText]],
+        ['DELETE FROM loans WHERE user_id = $1', [userIdText]],
+        ['DELETE FROM reviews WHERE user_id = $1', [userIdText]],
+      ];
+
+      for (const [query, params] of cleanupQueries) {
+        await executeQuery(query, params);
+      }
+
+      const col = 'firebase_uid';
+      const rows = await executeQuery(
+        `DELETE FROM ${isNeon ? 'users' : 'Users'} WHERE ${col} = $1 RETURNING *`,
+        [uid]
+      );
+
+      return { success: true, data: rows[0] || null };
+    } catch (error) {
+      console.error('deleteUserByUid error:', error.message);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Get all users (admin only)
+   */
+  static async getAllUsers(limit = 100, offset = 0) {
+    try {
+      const tableName = isNeon ? 'users' : 'Users';
+      const rows = await executeQuery(
+        isNeon
+          ? `SELECT
+              id,
+              firebase_uid AS uid,
+              email,
+              username,
+              display_name AS "displayName",
+              avatar_url AS "avatarUrl",
+              role,
+              COALESCE(status, 'active') AS status,
+              COALESCE(total_read, 0) AS "totalRead",
+              created_at AS "createdAt"
+            FROM users
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2`
+          : `SELECT
+              id,
+              uid,
+              email,
+              displayName,
+              photoURL AS avatarUrl,
+              role,
+              COALESCE(status, 'active') AS status,
+              COALESCE(total_read, 0) AS totalRead,
+              createdAt
+            FROM Users
+            ORDER BY createdAt DESC
+            OFFSET $2 ROWS FETCH NEXT $1 ROWS ONLY`,
+        [limit, offset]
+      );
+      const countResult = await executeQuery(`SELECT COUNT(*) as total FROM ${tableName}`);
+      const total = countResult[0]?.total || 0;
+      
+      return { success: true, data: rows, total };
+    } catch (error) {
+      console.error('getAllUsers error:', error.message);
+      return { success: false, error: error.message };
+    }
+  }
+
   static async userExists(uid) {
     const result = await this.getUserByUid(uid);
     return result.success && result.data !== null;
+  }
+
+  static async recordLoginEvent(uid) {
+    try {
+      await executeQuery(
+        `INSERT INTO login_events (firebase_uid, login_at)
+         VALUES ($1, CURRENT_TIMESTAMP)`,
+        [uid]
+      );
+      return { success: true };
+    } catch (error) {
+      console.warn('recordLoginEvent warning:', error.message);
+      return { success: false, error: error.message };
+    }
   }
 }
 

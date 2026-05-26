@@ -1,5 +1,7 @@
 const db = require('../config/database');
 const UserService = require('../services/userService');
+const { insertNotification, getUserContact } = require('../services/notificationService');
+const { sendEmail } = require('../services/emailService');
 
 function toRows(result) {
   if (Array.isArray(result)) return result;
@@ -48,6 +50,52 @@ function formatBookSummary(row) {
   };
 }
 
+function buildGenreStats(rows, limit = 5) {
+  const genreCounts = new Map();
+  let totalGenreOccurrences = 0;
+
+  for (const row of rows) {
+    const genres = parseStringArray(row.genres);
+    for (const genre of genres) {
+      totalGenreOccurrences += 1;
+      genreCounts.set(genre, (genreCounts.get(genre) || 0) + 1);
+    }
+  }
+
+  const topGenres = Array.from(genreCounts.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'id'))
+    .slice(0, limit)
+    .map(([genre, count]) => ({
+      genre,
+      count: Number(count || 0),
+    }));
+
+  if (topGenres.length === 0) {
+    return [];
+  }
+
+  const total = topGenres.reduce((sum, item) => sum + item.count, 0) || 1;
+  const ranked = topGenres.map((item) => {
+    const exact = (item.count / total) * 100;
+    const base = Math.floor(exact);
+    return {
+      ...item,
+      pct: base,
+      remainder: exact - base,
+    };
+  });
+
+  let remaining = 100 - ranked.reduce((sum, item) => sum + item.pct, 0);
+  const order = [...ranked].sort((a, b) => b.remainder - a.remainder || b.count - a.count || a.genre.localeCompare(b.genre, 'id'));
+
+  for (let index = 0; index < remaining; index += 1) {
+    const target = order[index % order.length];
+    target.pct += 1;
+  }
+
+  return ranked.map(({ genre, count, pct }) => ({ genre, count, pct }));
+}
+
 function toNonEmptyString(value) {
   if (value === null || value === undefined) return null;
   const text = String(value).trim();
@@ -85,6 +133,19 @@ function toHandle(value, fallbackId) {
   return `pustara_${toShortId(fallbackId)}`;
 }
 
+/**
+ * Normalize username candidate to match frontend register flow exactly.
+ */
+function normalizeUsernameCandidate(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_\-\s.]/g, ' ')
+    .replace(/[.\-\s]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
 function toDisplayName(value, fallbackId) {
   const text = toNonEmptyString(value);
   if (text && !looksGeneratedHandle(text)) return text;
@@ -107,6 +168,37 @@ function buildPublicIdentity(userLike) {
     username,
     name: display_name,
   };
+}
+
+function buildAvatarProxyUrl(userId, hasAvatar) {
+  if (!hasAvatar || !userId) return null;
+  return `/users/${encodeURIComponent(String(userId))}/avatar`;
+}
+
+const AVATAR_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const AVATAR_CACHE_MAX_ITEMS = 250;
+const avatarProxyCache = new Map();
+
+function getAvatarCacheKey(userId, avatarUrl) {
+  return `${String(userId)}:${String(avatarUrl)}`;
+}
+
+function readAvatarCache(key) {
+  const cached = avatarProxyCache.get(key);
+  if (!cached) return null;
+  if (Date.now() - cached.createdAt > AVATAR_CACHE_TTL_MS) {
+    avatarProxyCache.delete(key);
+    return null;
+  }
+  return cached;
+}
+
+function writeAvatarCache(key, value) {
+  if (avatarProxyCache.size >= AVATAR_CACHE_MAX_ITEMS) {
+    const oldestKey = avatarProxyCache.keys().next().value;
+    if (oldestKey) avatarProxyCache.delete(oldestKey);
+  }
+  avatarProxyCache.set(key, { ...value, createdAt: Date.now() });
 }
 
 const STREAK_TIME_ZONE = 'Asia/Jakarta';
@@ -184,6 +276,79 @@ function calculateConsecutiveStreak(timestamps) {
   return streak;
 }
 
+function nextDayKey(dayKey) {
+  if (!dayKey) return null;
+  const date = dayKeyToUtcDate(dayKey);
+  if (!date) return null;
+  date.setUTCDate(date.getUTCDate() + 1);
+  return toDayKeyInTimeZone(date);
+}
+
+function buildStreakSummary(timestamps) {
+  if (!Array.isArray(timestamps) || timestamps.length === 0) {
+    return {
+      currentStreak: 0,
+      isActiveToday: false,
+      lastActiveDayKey: null,
+      lastStreakStartDayKey: null,
+      lastStreakEndDayKey: null,
+      lastStreakLength: 0,
+      resetDayKey: null,
+    };
+  }
+
+  const days = new Set();
+  for (const ts of timestamps) {
+    const key = toDayKeyInTimeZone(ts);
+    if (key) days.add(key);
+  }
+
+  if (days.size === 0) {
+    return {
+      currentStreak: 0,
+      isActiveToday: false,
+      lastActiveDayKey: null,
+      lastStreakStartDayKey: null,
+      lastStreakEndDayKey: null,
+      lastStreakLength: 0,
+      resetDayKey: null,
+    };
+  }
+
+  const sortedDays = Array.from(days).sort((a, b) => {
+    const da = dayKeyToUtcDate(a);
+    const db = dayKeyToUtcDate(b);
+    return (db?.getTime() || 0) - (da?.getTime() || 0);
+  });
+
+  const latestDayKey = sortedDays[0];
+  const todayDayKey = toDayKeyInTimeZone(new Date());
+  let streakLength = 1;
+
+  for (let i = 1; i < sortedDays.length; i += 1) {
+    const diff = diffDays(sortedDays[i - 1], sortedDays[i]);
+    if (diff === 1) {
+      streakLength += 1;
+      continue;
+    }
+    break;
+  }
+
+  const lastStreakEndDayKey = latestDayKey;
+  const lastStreakStartDayKey = sortedDays[Math.max(0, streakLength - 1)];
+  const isActiveToday = Boolean(todayDayKey && latestDayKey === todayDayKey);
+
+  return {
+    currentStreak: isActiveToday ? streakLength : 0,
+    isActiveToday,
+    lastActiveDayKey: latestDayKey,
+    lastStreakStartDayKey,
+    lastStreakEndDayKey,
+    lastStreakLength: streakLength,
+    resetDayKey: isActiveToday ? null : nextDayKey(lastStreakEndDayKey),
+  };
+}
+
 async function resolveActorUserId(req) {
   if (!req.user?.uid) return null;
 
@@ -191,6 +356,48 @@ async function resolveActorUserId(req) {
   if (!actor.success || !actor.data?.id) return null;
 
   return String(actor.data.id);
+}
+
+/**
+ * Resolve a username or numeric ID to a user ID (numeric ID)
+ * @param {string} usernameOrId - Username or numeric ID
+ * @returns {Promise<string|null>} - User ID or null if not found
+ */
+async function resolveUsernameOrIdToUserId(usernameOrId) {
+  if (!usernameOrId) return null;
+
+  const normalized = String(usernameOrId).trim();
+  const decoded = (() => {
+    try {
+      return decodeURIComponent(normalized);
+    } catch (_) {
+      return normalized;
+    }
+  })();
+  const candidate = decoded.startsWith('@') ? decoded.slice(1) : decoded;
+
+  // If it already looks like a direct user ID, use it as-is.
+  if (/^\d+$/.test(candidate) || /^[0-9a-fA-F-]{16,}$/.test(candidate)) {
+    return candidate;
+  }
+
+  // Otherwise, treat it as a username and query
+  try {
+    const rows = toRows(
+      await db.executeQuery(
+        'SELECT id FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1',
+        [candidate]
+      )
+    );
+
+    if (rows.length > 0) {
+      return String(rows[0].id);
+    }
+  } catch (err) {
+    console.error('Error resolving username:', err.message);
+  }
+
+  return null;
 }
 
 async function countFollowers(userId) {
@@ -207,24 +414,44 @@ async function countFollowing(userId) {
   return Number(rows[0]?.total || 0);
 }
 
+async function getUserDisplaySummary(userId) {
+  const rows = toRows(
+    await db.executeQuery(
+      'SELECT id, username, display_name, email FROM users WHERE id = $1 LIMIT 1',
+      [userId]
+    )
+  );
+  if (rows.length === 0) return { name: 'Pustara Reader', username: '' };
+  const identity = buildPublicIdentity(rows[0]);
+  return {
+    name: identity.display_name,
+    username: identity.username,
+  };
+}
+
 function mapUserCard(user, isFollowing = false) {
   return {
     id: String(user.id),
+    firebase_uid: user.firebase_uid ? String(user.firebase_uid) : null,
     ...buildPublicIdentity(user),
     bio: user.bio || '',
-    avatar_url: user.avatar_url || null,
+    avatar_url: buildAvatarProxyUrl(user.id, user.avatar_url),
     preferred_genres: parseStringArray(user.preferred_genres),
     followers_count: Number(user.followers_count || 0),
     total_read: Number(user.total_read || 0),
+    reviews_written: Number(user.reviews_written || 0),
     reading_streak: Number(user.reading_streak || 0),
     is_following: Boolean(isFollowing),
   };
 }
 
-async function buildUserProfile(targetUserId, actorId = null) {
+async function buildUserProfile(targetUserId, actorId = null, userUid = null) {
   const userRows = toRows(
     await db.executeQuery(
-      'SELECT id, username, display_name, email, bio, avatar_url, preferred_genres, reading_streak, total_read, created_at, updated_at FROM users WHERE id = $1',
+      `SELECT id, firebase_uid, username, display_name, email, bio, avatar_url, preferred_genres,
+              reading_streak, total_read, created_at, updated_at,
+              activity_visible, public_reading_list, public_reviews
+       FROM users WHERE id = $1`,
       [targetUserId]
     )
   );
@@ -235,6 +462,31 @@ async function buildUserProfile(targetUserId, actorId = null) {
 
   const user = userRows[0];
   const identity = buildPublicIdentity(user);
+
+  // ─────────────────────────────────────────────────────────────────────
+  // PRIVACY ENFORCEMENT: Determine what data can be viewed
+  // ─────────────────────────────────────────────────────────────────────
+  // isOwner: viewing user is the target user (always sees everything)
+  // Primary check: actorId (internal DB ID) matches targetUserId
+  // Fallback check: firebase_uid matches if async lookup failed
+  let isOwner = actorId && String(actorId) === String(targetUserId);
+  
+  // DEFENSIVE FALLBACK: If actorId is null but user is authenticated
+  // Use firebase_uid comparison to detect owner (in case async lookup failed)
+  if (!isOwner && userUid && user.firebase_uid === userUid) {
+    console.warn(
+      '[buildUserProfile] Using firebase_uid fallback for owner detection. ' +
+      'firebase_uid:', userUid, 
+      'targetUserId:', targetUserId
+    );
+    isOwner = true;
+  }
+  
+  // Privacy flags: default to true (public) if not explicitly false
+  // Reuses same pattern as review privacy checks
+  const canViewReading = isOwner || (user.public_reading_list !== false);
+  const canViewReviews = isOwner || (user.public_reviews !== false);
+  const canViewActivity = isOwner || (user.activity_visible !== false);
 
   const [followersCount, followingCount] = await Promise.all([
     countFollowers(targetUserId),
@@ -255,92 +507,257 @@ async function buildUserProfile(targetUserId, actorId = null) {
   let currentlyReading = [];
   let likedBooks = [];
   let finishedCount = 0;
+  let reviewsWritten = 0;
+  let favoriteGenres = [];
   let computedStreak = 0;
+  let streakSummary = {
+    currentStreak: 0,
+    isActiveToday: false,
+    lastActiveDayKey: null,
+    lastStreakStartDayKey: null,
+    lastStreakEndDayKey: null,
+    resetDayKey: null,
+  };
 
-  try {
-    const readingRows = toRows(
-      await db.executeQuery(
-        `SELECT b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
-                rs.progress_percentage, rs.last_read_at
-         FROM reading_sessions rs
-         JOIN books b ON b.id = rs.book_id
-         WHERE rs.user_id = $1
-           AND b.is_active = true
-           AND (rs.status = 'reading' OR rs.status = 'active')
-         ORDER BY rs.last_read_at DESC
-         LIMIT 5`,
-        [targetUserId]
-      )
-    );
+  // READING DATA: Gated by public_reading_list
+  // Only fetch currently_reading books if user has reading list public OR actor is owner
+  if (canViewReading) {
+    try {
+      const readingRows = toRows(
+        await db.executeQuery(
+          `SELECT b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages,
+                  rs.progress_percentage, rs.last_read_at
+           FROM reading_sessions rs
+           JOIN books b ON b.id = rs.book_id
+           WHERE rs.user_id = $1
+             AND b.is_active = true
+             AND (rs.status = 'reading' OR rs.status = 'active')
+           ORDER BY rs.last_read_at DESC
+           LIMIT 5`,
+          [targetUserId]
+        )
+      );
 
-    currentlyReading = readingRows.map((row) => ({
-      ...formatBookSummary(row),
-      progress_percentage: Number(row.progress_percentage || 0),
-      last_read_at: row.last_read_at || null,
-    }));
-  } catch (_) {
+      currentlyReading = readingRows.map((row) => ({
+        ...formatBookSummary(row),
+        progress_percentage: Number(row.progress_percentage || 0),
+        last_read_at: row.last_read_at || null,
+      }));
+    } catch (_) {
+      currentlyReading = [];
+    }
+
+    // WISHLIST DATA: Gated by public_reading_list
+    // Only fetch wishlist books if user has reading list public OR actor is owner
+    try {
+      const likedRows = toRows(
+        await db.executeQuery(
+          `SELECT b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages, w.added_at
+           FROM wishlist w
+           JOIN books b ON b.id = w.book_id
+           WHERE w.user_id = $1
+             AND b.is_active = true
+           ORDER BY w.added_at DESC
+           LIMIT 10`,
+          [targetUserId]
+        )
+      );
+
+      likedBooks = likedRows.map((row) => ({
+        ...formatBookSummary(row),
+        liked_at: row.added_at || null,
+      }));
+    } catch (_) {
+      likedBooks = [];
+    }
+  } else {
+    // Privacy: reading_list is private - return empty arrays
     currentlyReading = [];
-  }
-
-  try {
-    const likedRows = toRows(
-      await db.executeQuery(
-        `SELECT b.id, b.title, b.authors, b.genres, b.cover_url, b.avg_rating, b.year, b.pages, w.added_at
-         FROM wishlist w
-         JOIN books b ON b.id = w.book_id
-         WHERE w.user_id = $1
-           AND b.is_active = true
-         ORDER BY w.added_at DESC
-         LIMIT 10`,
-        [targetUserId]
-      )
-    );
-
-    likedBooks = likedRows.map((row) => ({
-      ...formatBookSummary(row),
-      liked_at: row.added_at || null,
-    }));
-  } catch (_) {
     likedBooks = [];
   }
 
-  try {
-    const finishedRows = toRows(
-      await db.executeQuery(
-        `SELECT COUNT(*) AS total
-         FROM reading_sessions
-         WHERE user_id = $1
-           AND status = 'finished'`,
-        [targetUserId]
-      )
-    );
-    finishedCount = Number(finishedRows[0]?.total || 0);
-  } catch (_) {
+  // READING HISTORY COUNT: Gated by public_reading_list
+  // Only compute finished books count if reading list is public OR actor is owner
+  if (canViewReading) {
+    try {
+      // Count finished history items using the same logic as /shelf/me
+      const finishedCountRows = toRows(
+        await db.executeQuery(
+          `SELECT COUNT(*) AS total FROM (
+             -- returned loans
+             SELECT
+               b.id,
+               CASE
+                 WHEN rs.id IS NULL THEN 'unfinished'
+                 WHEN COALESCE(rs.progress_percentage, 0) >= 100
+                   OR COALESCE(rs.current_page, 0) >= COALESCE(rs.total_pages, 0) THEN 'finished'
+                 ELSE 'unfinished'
+               END AS history_status
+             FROM loans l
+             JOIN books b ON b.id = l.book_id
+             LEFT JOIN LATERAL (
+               SELECT id, current_page, total_pages, progress_percentage, finished_at, started_at, reading_time_minutes
+               FROM reading_sessions
+               WHERE book_id = l.book_id AND user_id = l.user_id
+               ORDER BY COALESCE(finished_at, last_read_at, started_at) DESC
+               LIMIT 1
+             ) rs ON true
+             WHERE l.user_id = $1
+               AND b.is_active = true
+               AND l.returned_at IS NOT NULL
+
+             UNION ALL
+
+             -- finished reading sessions that are not tied to a returned loan
+             SELECT
+               b.id,
+               CASE
+                 WHEN COALESCE(rs.progress_percentage, 0) < 100
+                  OR COALESCE(rs.current_page, 0) < COALESCE(rs.total_pages, 0) THEN 'unfinished'
+                 ELSE 'finished'
+               END AS history_status
+             FROM reading_sessions rs
+             JOIN books b ON b.id = rs.book_id
+             WHERE rs.user_id = $1
+               AND b.is_active = true
+               AND rs.status = 'finished'
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM loans l
+                 WHERE l.book_id = rs.book_id
+                   AND l.user_id = rs.user_id
+                   AND l.returned_at IS NOT NULL
+               )
+           ) sub WHERE history_status = 'finished'`,
+          [targetUserId]
+        )
+      );
+      finishedCount = Number(finishedCountRows[0]?.total ?? 0);
+    } catch (_) {
+      finishedCount = 0;
+    }
+  } else {
+    // Privacy: reading_list is private - don't expose finished count
     finishedCount = 0;
   }
 
-  try {
-    const streakRows = toRows(
-      await db.executeQuery(
-        `SELECT COALESCE(last_read_at, finished_at, started_at) AS event_time
-         FROM reading_sessions
-         WHERE user_id = $1
-           AND COALESCE(last_read_at, finished_at, started_at) IS NOT NULL
-           AND status IN ('reading', 'active', 'finished')
-         ORDER BY COALESCE(last_read_at, finished_at, started_at) DESC
-         LIMIT 400`,
-        [targetUserId]
-      )
-    );
-    computedStreak = calculateConsecutiveStreak(streakRows.map((row) => row.event_time));
-  } catch (_) {
+  // FAVORITE GENRES: Gated by public_reading_list
+  // Only compute favorite genres if reading list is public OR actor is owner
+  if (canViewReading) {
+    try {
+      const borrowedGenreRows = toRows(
+        await db.executeQuery(
+          `SELECT b.genres
+           FROM loans l
+           JOIN books b ON b.id = l.book_id
+           WHERE l.user_id = $1
+             AND b.is_active = true`,
+          [targetUserId]
+        )
+      );
+      favoriteGenres = buildGenreStats(borrowedGenreRows, 5);
+    } catch (_) {
+      favoriteGenres = [];
+    }
+  } else {
+    // Privacy: reading_list is private - don't expose favorite genres
+    favoriteGenres = [];
+  }
+
+  // ACTIVE BORROWED COUNT: Gated by public_reading_list (used for profile stats)
+  // Only fetch if reading list is public OR actor is owner
+  let activeBorrowedCount = 0;
+  if (canViewReading) {
+    try {
+      const activeBorrowedRows = toRows(
+        await db.executeQuery(
+          `SELECT COUNT(DISTINCT b.id) AS total
+           FROM loans l
+           JOIN books b ON b.id = l.book_id
+           WHERE l.user_id = $1
+             AND b.is_active = true
+             AND l.returned_at IS NULL
+             AND l.status IN ('active', 'extended')`,
+          [targetUserId]
+        )
+      );
+      activeBorrowedCount = Number(activeBorrowedRows[0]?.total ?? 0);
+    } catch (_) {
+      activeBorrowedCount = 0;
+    }
+  } else {
+    activeBorrowedCount = 0;
+  }
+
+  // REVIEWS COUNT: Gated by public_reviews
+  // Only fetch review count if user has reviews public OR actor is owner
+  if (canViewReviews) {
+    try {
+      const reviewRows = toRows(
+        await db.executeQuery(
+          `SELECT COUNT(*) AS total
+           FROM reviews
+           WHERE user_id = $1`,
+          [targetUserId]
+        )
+      );
+      reviewsWritten = Number(reviewRows[0]?.total || 0);
+    } catch (_) {
+      reviewsWritten = 0;
+    }
+  } else {
+    // Privacy: reviews are private - don't expose review count
+    reviewsWritten = 0;
+  }
+
+  // ACTIVITY/STREAK DATA: Gated by activity_visible
+  // Only fetch activity data if user has activity visible OR actor is owner
+  if (canViewActivity) {
+    try {
+      const streakRows = toRows(
+        await db.executeQuery(
+          `SELECT login_at AS event_time
+           FROM login_events
+           WHERE firebase_uid = $1
+             AND login_at IS NOT NULL
+           ORDER BY login_at DESC
+           LIMIT 400`,
+          [user.firebase_uid || user.uid || user.email || targetUserId]
+        )
+      );
+      const streakTimestamps = streakRows.map((row) => row.event_time);
+      computedStreak = calculateConsecutiveStreak(streakTimestamps);
+      streakSummary = buildStreakSummary(streakTimestamps);
+    } catch (_) {
+      computedStreak = 0;
+      streakSummary = {
+        currentStreak: 0,
+        isActiveToday: false,
+        lastActiveDayKey: null,
+        lastStreakStartDayKey: null,
+        lastStreakEndDayKey: null,
+        lastStreakLength: 0,
+        resetDayKey: null,
+      };
+    }
+  } else {
+    // Privacy: activity is private - don't expose streak data
     computedStreak = 0;
+    streakSummary = {
+      currentStreak: 0,
+      isActiveToday: false,
+      lastActiveDayKey: null,
+      lastStreakStartDayKey: null,
+      lastStreakEndDayKey: null,
+      lastStreakLength: 0,
+      resetDayKey: null,
+    };
   }
 
   const storedStreak = Number(user.reading_streak || 0);
   const storedTotalRead = Number(user.total_read || 0);
-  const resolvedStreak = computedStreak > 0 ? computedStreak : Math.max(0, storedStreak);
-  const resolvedTotalRead = Math.max(0, storedTotalRead, finishedCount);
+  const resolvedStreak = Math.max(0, computedStreak, streakSummary.currentStreak);
+  const resolvedTotalRead = Math.max(0, finishedCount);
 
   return {
     id: String(user.id),
@@ -349,7 +766,7 @@ async function buildUserProfile(targetUserId, actorId = null) {
     name: identity.name,
     email: user.email || null,
     bio: user.bio || '',
-    avatar_url: user.avatar_url || null,
+    avatar_url: buildAvatarProxyUrl(user.id, user.avatar_url),
     preferred_genres: parseStringArray(user.preferred_genres),
     total_read: resolvedTotalRead,
     reading_streak: resolvedStreak,
@@ -360,15 +777,49 @@ async function buildUserProfile(targetUserId, actorId = null) {
     is_following: isFollowing,
     currently_reading: currentlyReading,
     liked_books: likedBooks,
+    stats: {
+      total_read: resolvedTotalRead,
+      reading_streak: resolvedStreak,
+      reviews_written: reviewsWritten,
+      favorite_genres: favoriteGenres,
+    },
+    streak_is_active: streakSummary.isActiveToday,
+    streak_last_length: streakSummary.lastStreakLength,
+    streak_last_active_day: streakSummary.lastActiveDayKey,
+    streak_last_start_day: streakSummary.lastStreakStartDayKey,
+    streak_last_end_day: streakSummary.lastStreakEndDayKey,
+    streak_reset_day: streakSummary.resetDayKey,
   };
 }
 
 exports.getUserProfile = async (req, res) => {
   try {
     const { id } = req.params;
+    console.log(`[getUserProfile] Incoming request for: ${id}`);
     const actorId = await resolveActorUserId(req);
+    
+    // DEFENSIVE: Log if async lookup failed for authenticated users
+    if (!actorId && req.user?.uid) {
+      console.warn(
+        '[getUserProfile] WARNING: resolveActorUserId returned null for authenticated user. ' +
+        'firebase_uid:', req.user.uid,
+        'Will use firebase_uid fallback in buildUserProfile.'
+      );
+    }
 
-    const profile = await buildUserProfile(id, actorId);
+    // Resolve username or ID to actual user ID
+    const targetUserId = await resolveUsernameOrIdToUserId(id);
+    console.log(`[getUserProfile] Resolved ID: ${targetUserId}`);
+    
+    if (!targetUserId) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found',
+        error: { code: 'USER_NOT_FOUND', id },
+      });
+    }
+
+    const profile = await buildUserProfile(targetUserId, actorId, req.user?.uid);
     if (!profile) {
       return res.status(404).json({
         success: false,
@@ -414,30 +865,18 @@ exports.getMyProfile = async (req, res) => {
 
 exports.checkUsernameAvailability = async (req, res) => {
   try {
-    const rawUsername = typeof req.query?.username === 'string' ? req.query.username.trim() : '';
-    const normalizedUsername = rawUsername
-      .toLowerCase()
-      .replace(/[^a-z0-9_\-\s.]/g, ' ')
-      .replace(/[.\-\s]+/g, '_')
-      .replace(/_+/g, '_')
-      .replace(/^_+|_+$/g, '');
+    const rawUsername = typeof req.query?.username === 'string' ? req.query.username : '';
+    const normalizedUsername = normalizeUsernameCandidate(rawUsername);
 
-    if (!normalizedUsername) {
-      return res.status(400).json({
-        success: false,
+    if (!normalizedUsername || normalizedUsername.length < 3) {
+      return res.json({
+        success: true,
         available: false,
-        message: 'Username wajib diisi.',
+        message: 'Username terlalu pendek (min. 3 karakter).'
       });
     }
 
-    if (normalizedUsername.length < 3 || normalizedUsername.length > 24) {
-      return res.status(400).json({
-        success: false,
-        available: false,
-        message: 'Username harus 3-24 karakter.',
-      });
-    }
-
+    // Query ke Neon DB
     const rows = toRows(
       await db.executeQuery(
         'SELECT id FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1',
@@ -449,14 +888,15 @@ exports.checkUsernameAvailability = async (req, res) => {
       success: true,
       available: rows.length === 0,
       username: normalizedUsername,
-      message: rows.length === 0 ? 'Username tersedia.' : 'Username sudah digunakan.',
+      normalizedUsername,
+      message: rows.length === 0 ? 'Username tersedia.' : 'Username sudah digunakan.'
     });
   } catch (error) {
     console.error('Error checking username availability:', error.message);
     return res.status(500).json({
       success: false,
       available: false,
-      message: 'Gagal memeriksa username.',
+      message: 'Gagal memeriksa username.'
     });
   }
 };
@@ -475,6 +915,7 @@ exports.updateMyProfile = async (req, res) => {
     const inputDisplayName = typeof req.body?.display_name === 'string' ? req.body.display_name.trim() : '';
     const inputUsername = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
     const inputBio = typeof req.body?.bio === 'string' ? req.body.bio.trim() : '';
+    const inputAvatarUrl = typeof req.body?.avatar_url === 'string' ? req.body.avatar_url.trim() : '';
     const inputPreferredGenres = req.body?.preferred_genres;
 
     if (inputName || inputDisplayName) {
@@ -483,14 +924,12 @@ exports.updateMyProfile = async (req, res) => {
     if (typeof req.body?.bio === 'string') {
       updates.bio = inputBio;
     }
+    if (typeof req.body?.avatar_url === 'string') {
+      updates.avatar_url = inputAvatarUrl || null;
+    }
 
     if (typeof req.body?.username === 'string') {
-      const normalizedUsername = inputUsername
-        .toLowerCase()
-        .replace(/[^a-z0-9_\-\s.]/g, ' ')
-        .replace(/[.\-\s]+/g, '_')
-        .replace(/_+/g, '_')
-        .replace(/^_+|_+$/g, '');
+      const normalizedUsername = normalizeUsernameCandidate(inputUsername);
 
       if (!normalizedUsername || normalizedUsername.length < 3 || normalizedUsername.length > 24) {
         return res.status(400).json({
@@ -562,15 +1001,82 @@ exports.updateMyProfile = async (req, res) => {
   }
 };
 
+exports.getUserAvatar = async (req, res) => {
+  try {
+    const userId = String(req.params.id || '').trim();
+    if (!userId) {
+      return res.status(400).json({ success: false, message: 'User ID is required' });
+    }
+
+    const rows = toRows(
+      await db.executeQuery(
+        'SELECT avatar_url FROM users WHERE id = $1 LIMIT 1',
+        [userId]
+      )
+    );
+
+    const avatarUrl = rows[0]?.avatar_url ? String(rows[0].avatar_url).trim() : '';
+    if (!avatarUrl) {
+      return res.status(404).json({ success: false, message: 'Avatar not found' });
+    }
+
+    const cacheKey = getAvatarCacheKey(userId, avatarUrl);
+    const cached = readAvatarCache(cacheKey);
+    if (cached) {
+      res.setHeader('Content-Type', cached.contentType);
+      res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
+      res.setHeader('ETag', cached.etag);
+      if (req.headers['if-none-match'] === cached.etag) {
+        return res.status(304).end();
+      }
+      return res.status(200).send(cached.buffer);
+    }
+
+    const response = await fetch(avatarUrl, {
+      headers: {
+        'User-Agent': 'PustaraAvatarProxy/1.0',
+      },
+    });
+
+    if (!response.ok || !response.body) {
+      return res.status(502).json({ success: false, message: 'Failed to fetch avatar' });
+    }
+
+    const contentType = response.headers.get('content-type') || 'image/jpeg';
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    const etag = `"avatar-${userId}-${buffer.length}-${Date.now()}"`;
+    writeAvatarCache(cacheKey, { buffer, contentType, etag });
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
+    res.setHeader('ETag', etag);
+
+    return res.status(200).send(buffer);
+  } catch (error) {
+    console.error('Error serving avatar proxy:', error.message);
+    return res.status(500).json({ success: false, message: 'Failed to serve avatar' });
+  }
+};
+
 exports.followUser = async (req, res) => {
   try {
-    const targetUserId = String(req.params.id);
+    const { id } = req.params;
     const actorUserId = await resolveActorUserId(req);
 
     if (!actorUserId) {
       return res.status(401).json({
         success: false,
         message: 'Authentication required to follow user',
+      });
+    }
+
+    // Resolve username or ID to actual user ID
+    const targetUserId = await resolveUsernameOrIdToUserId(id);
+    if (!targetUserId) {
+      return res.status(404).json({
+        success: false,
+        message: 'Target user not found',
       });
     }
 
@@ -603,6 +1109,42 @@ exports.followUser = async (req, res) => {
         'INSERT INTO follows (follower_id, following_id, created_at) VALUES ($1, $2, CURRENT_TIMESTAMP)',
         [actorUserId, targetUserId]
       );
+
+      try {
+        const actor = await getUserDisplaySummary(actorUserId);
+        const body = `${actor.name} mulai mengikuti aktivitas membacamu di Pustara.`;
+
+        await insertNotification({
+          userId: targetUserId,
+          type: 'follow',
+          title: 'Pengikut Baru',
+          body,
+          actorId: actorUserId,
+          data: {
+            follower_id: actorUserId,
+            follower_username: actor.username,
+          },
+        });
+
+        const contact = await getUserContact(targetUserId);
+        if (contact?.email) {
+          await sendEmail({
+            to: contact.email,
+            subject: 'Pustara - Ada Pengikut Baru',
+            text: [
+              `Halo ${contact.name || 'Pustara Reader'},`,
+              '',
+              body,
+              '',
+              'Buka Pustara untuk melihat profil dan aktivitas terbaru.',
+            ].join('\n'),
+          }).catch((mailError) => {
+            console.warn('Follow email warning:', mailError.message);
+          });
+        }
+      } catch (notifyError) {
+        console.warn('Follow notification warning:', notifyError.message);
+      }
     }
 
     const [followersCount, followingCount] = await Promise.all([
@@ -629,13 +1171,22 @@ exports.followUser = async (req, res) => {
 
 exports.unfollowUser = async (req, res) => {
   try {
-    const targetUserId = String(req.params.id);
+    const { id } = req.params;
     const actorUserId = await resolveActorUserId(req);
 
     if (!actorUserId) {
       return res.status(401).json({
         success: false,
         message: 'Authentication required to unfollow user',
+      });
+    }
+
+    // Resolve username or ID to actual user ID
+    const targetUserId = await resolveUsernameOrIdToUserId(id);
+    if (!targetUserId) {
+      return res.status(404).json({
+        success: false,
+        message: 'Target user not found',
       });
     }
 
@@ -669,7 +1220,7 @@ exports.unfollowUser = async (req, res) => {
 exports.getRecommendedUsers = async (req, res) => {
   try {
     const actorId = await resolveActorUserId(req);
-    const limit = Math.min(Math.max(Number.parseInt(String(req.query.limit || 8), 10) || 8, 5), 10);
+    const limit = Math.min(Math.max(Number.parseInt(String(req.query.limit || 8), 10) || 8, 1), 20);
 
     const params = [];
     let whereClause = '';
@@ -689,8 +1240,9 @@ exports.getRecommendedUsers = async (req, res) => {
 
     const recommendationRows = toRows(
       await db.executeQuery(
-        `SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.preferred_genres,
-                u.total_read, u.reading_streak,
+      `SELECT u.id, u.firebase_uid, u.username, u.display_name, u.bio, u.avatar_url, u.preferred_genres,
+        u.total_read, u.reading_streak,
+        (SELECT COUNT(*) FROM reviews r WHERE r.user_id = u.id) AS reviews_written,
                 (SELECT COUNT(*) FROM follows f WHERE f.following_id = u.id) AS followers_count
          FROM users u
          ${whereClause}
@@ -708,7 +1260,9 @@ exports.getRecommendedUsers = async (req, res) => {
       preferred_genres: parseStringArray(user.preferred_genres),
       followers_count: Number(user.followers_count || 0),
       total_read: Number(user.total_read || 0),
+      reviews_written: Number(user.reviews_written || 0),
       reading_streak: Number(user.reading_streak || 0),
+      firebase_uid: user.firebase_uid ? String(user.firebase_uid) : null,
       is_following: false,
     }));
 
@@ -726,6 +1280,56 @@ exports.getRecommendedUsers = async (req, res) => {
   }
 };
 
+exports.searchUsers = async (req, res) => {
+  try {
+    const actorId = await resolveActorUserId(req);
+    const query = String(req.query.q || req.query.query || '').trim();
+    const limit = Math.min(Math.max(Number.parseInt(String(req.query.limit || 12), 10) || 12, 1), 20);
+
+    if (!query) {
+      return res.json({
+        success: true,
+        data: [],
+        meta: { total: 0, limit, query },
+      });
+    }
+
+    const rows = toRows(
+      await db.executeQuery(
+        `SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.preferred_genres,
+                u.total_read, u.reading_streak,
+                (SELECT COUNT(*) FROM follows f WHERE f.following_id = u.id) AS followers_count,
+                ${actorId ? `EXISTS(
+                  SELECT 1
+                  FROM follows f2
+                  WHERE f2.follower_id = $2
+                    AND f2.following_id = u.id
+                )` : 'false'} AS is_following
+         FROM users u
+         WHERE (${actorId ? 'u.id <> $2 AND' : ''} (
+           u.username ILIKE $1
+           OR COALESCE(u.display_name, '') ILIKE $1
+           OR COALESCE(u.bio, '') ILIKE $1
+         ))
+         ORDER BY followers_count DESC, u.total_read DESC, u.created_at DESC
+         LIMIT $${actorId ? 3 : 2}`,
+        actorId ? [`%${query}%`, actorId, limit] : [`%${query}%`, limit]
+      )
+    );
+
+    const data = rows.map((user) => mapUserCard(user, Boolean(user.is_following)));
+
+    res.json({
+      success: true,
+      data,
+      meta: { total: data.length, limit, query },
+    });
+  } catch (error) {
+    console.error('Error searching users:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
 exports.getMyFollowing = async (req, res) => {
   try {
     const actorId = await resolveActorUserId(req);
@@ -737,8 +1341,9 @@ exports.getMyFollowing = async (req, res) => {
 
     const rows = toRows(
       await db.executeQuery(
-        `SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.preferred_genres,
-                u.total_read, u.reading_streak,
+      `SELECT u.id, u.firebase_uid, u.username, u.display_name, u.bio, u.avatar_url, u.preferred_genres,
+        u.total_read, u.reading_streak,
+        (SELECT COUNT(*) FROM reviews r WHERE r.user_id = u.id) AS reviews_written,
                 (SELECT COUNT(*) FROM follows f2 WHERE f2.following_id = u.id) AS followers_count
          FROM follows f
          JOIN users u ON u.id = f.following_id
@@ -773,8 +1378,9 @@ exports.getMyFollowers = async (req, res) => {
 
     const rows = toRows(
       await db.executeQuery(
-        `SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.preferred_genres,
-                u.total_read, u.reading_streak,
+      `SELECT u.id, u.firebase_uid, u.username, u.display_name, u.bio, u.avatar_url, u.preferred_genres,
+        u.total_read, u.reading_streak,
+        (SELECT COUNT(*) FROM reviews r WHERE r.user_id = u.id) AS reviews_written,
                 (SELECT COUNT(*) FROM follows f2 WHERE f2.following_id = u.id) AS followers_count
          FROM follows f
          JOIN users u ON u.id = f.follower_id
@@ -800,5 +1406,112 @@ exports.getMyFollowers = async (req, res) => {
   } catch (error) {
     console.error('Error fetching followers list:', error.message);
     res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * Get privacy settings for authenticated user
+ * GET /api/user/privacy-settings
+ */
+exports.getPrivacySettings = async (req, res) => {
+  try {
+    if (!req.user?.uid) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required',
+      });
+    }
+
+    const userResult = await UserService.getUserByUid(req.user.uid);
+    if (!userResult.success || !userResult.data) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found',
+      });
+    }
+
+    const user = userResult.data;
+    return res.json({
+      success: true,
+      data: {
+        activity_visible: Boolean(user.activity_visible ?? true),
+        public_reading_list: Boolean(user.public_reading_list ?? true),
+        public_reviews: Boolean(user.public_reviews ?? true),
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching privacy settings:', error.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to fetch privacy settings',
+    });
+  }
+};
+
+/**
+ * Update privacy settings for authenticated user
+ * PUT /api/user/privacy-settings
+ * Body: { activity_visible?, public_reading_list?, public_reviews? }
+ */
+exports.updatePrivacySettings = async (req, res) => {
+  try {
+    if (!req.user?.uid) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required',
+      });
+    }
+
+    const updates = {};
+    const allowedFields = ['activity_visible', 'public_reading_list', 'public_reviews'];
+
+    // Validate and collect updates
+    for (const field of allowedFields) {
+      if (field in req.body) {
+        const value = req.body[field];
+        // Coerce to boolean safely: true/false/"true"/"false"/1/0 all work
+        if (value === true || value === false || value === 'true' || value === 'false' || value === 1 || value === 0) {
+          updates[field] = Boolean(value === true || value === 'true' || value === 1);
+        } else if (value !== null && value !== undefined) {
+          return res.status(400).json({
+            success: false,
+            message: `Invalid value for ${field}: must be boolean`,
+          });
+        }
+      }
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid privacy settings to update',
+      });
+    }
+
+    // Update using existing UserService
+    const updateResult = await UserService.updateUser(req.user.uid, updates);
+    if (!updateResult.success || !updateResult.data) {
+      return res.status(400).json({
+        success: false,
+        message: updateResult.error || 'Failed to update privacy settings',
+      });
+    }
+
+    const updatedUser = updateResult.data;
+    return res.json({
+      success: true,
+      message: 'Privacy settings updated successfully',
+      data: {
+        activity_visible: Boolean(updatedUser.activity_visible ?? true),
+        public_reading_list: Boolean(updatedUser.public_reading_list ?? true),
+        public_reviews: Boolean(updatedUser.public_reviews ?? true),
+      },
+    });
+  } catch (error) {
+    console.error('Error updating privacy settings:', error.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to update privacy settings',
+    });
   }
 };
